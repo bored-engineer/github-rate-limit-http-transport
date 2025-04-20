@@ -1,2 +1,2 @@
-# github-rate-limit-http-transport
-A Golang http.RoundTripper for monitoring the GitHub rate-limit responses from GitHub's REST API
+# GitHub Rate Limit HTTP Transport [![Go Reference](https://pkg.go.dev/badge/github.com/bored-engineer/github-rate-limit-http-transport.svg)](https://pkg.go.dev/github.com/bored-engineer/github-rate-limit-http-transport)
+A Golang [http.RoundTripper](https://pkg.go.dev/net/http#RoundTripper) for monitoring the [GitHub rate-limit responses](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api?apiVersion=2022-11-28) from GitHub's REST API.
