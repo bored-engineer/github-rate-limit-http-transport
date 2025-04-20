@@ -105,27 +105,21 @@ func TestLimits_UnmarshalJSON(t *testing.T) {
 	}
 	err := json.Unmarshal([]byte(limitsResponse), &resp)
 	assert.NoError(t, err, "json.Unmarshal failed")
-	expected := map[Resource]*Rate{
-		ResourceCore:                      NewRate(5000, 0, 5000, 1745121612),
-		ResourceSearch:                    NewRate(30, 0, 30, 1745118072),
-		ResourceGraphQL:                   NewRate(5000, 0, 5000, 1745121612),
-		ResourceIntegrationManifest:       NewRate(5000, 0, 5000, 1745121612),
-		ResourceSourceImport:              NewRate(100, 0, 100, 1745118072),
-		ResourceCodeScanningUpload:        NewRate(1000, 0, 1000, 1745121612),
-		ResourceCodeScanningAutofix:       NewRate(10, 0, 10, 1745118072),
-		ResourceActionsRunnerRegistration: NewRate(10000, 0, 10000, 1745121612),
-		ResourceSCIM:                      NewRate(15000, 0, 15000, 1745121612),
-		ResourceDependencySnapshots:       NewRate(100, 0, 100, 1745118072),
-		ResourceAuditLog:                  NewRate(1750, 0, 1750, 1745121612),
-		ResourceAuditLogStreaming:         NewRate(15, 0, 15, 1745121612),
-		ResourceCodeSearch:                NewRate(10, 0, 10, 1745118072),
-	}
-	actual := maps.Collect(resp.Resources.Iter())
-	assert.Equal(t, len(expected), len(actual), "length mismatch")
-	for resource, got := range actual {
-		want := expected[resource]
-		assert.True(t, want.Equal(got), "value mismatch, expected %s, got %s", want, got)
-	}
+	assert.Equal(t, map[Resource]*Rate{
+		ResourceCore:                      {Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612},
+		ResourceSearch:                    {Limit: 30, Used: 0, Remaining: 30, Reset: 1745118072},
+		ResourceGraphQL:                   {Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612},
+		ResourceIntegrationManifest:       {Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612},
+		ResourceSourceImport:              {Limit: 100, Used: 0, Remaining: 100, Reset: 1745118072},
+		ResourceCodeScanningUpload:        {Limit: 1000, Used: 0, Remaining: 1000, Reset: 1745121612},
+		ResourceCodeScanningAutofix:       {Limit: 10, Used: 0, Remaining: 10, Reset: 1745118072},
+		ResourceActionsRunnerRegistration: {Limit: 10000, Used: 0, Remaining: 10000, Reset: 1745121612},
+		ResourceSCIM:                      {Limit: 15000, Used: 0, Remaining: 15000, Reset: 1745121612},
+		ResourceDependencySnapshots:       {Limit: 100, Used: 0, Remaining: 100, Reset: 1745118072},
+		ResourceAuditLog:                  {Limit: 1750, Used: 0, Remaining: 1750, Reset: 1745121612},
+		ResourceAuditLogStreaming:         {Limit: 15, Used: 0, Remaining: 15, Reset: 1745121612},
+		ResourceCodeSearch:                {Limit: 10, Used: 0, Remaining: 10, Reset: 1745118072},
+	}, maps.Collect(resp.Resources.Iter()))
 }
 
 func TestLimits_Parse(t *testing.T) {
@@ -138,10 +132,12 @@ func TestLimits_Parse(t *testing.T) {
 		"X-Ratelimit-Resource":  []string{"core"},
 	})
 	assert.NoError(t, err, "(*Limits).Parse failed")
-	assert.Equal(t, uint64(5000), limits.Core.Limit.Load(), "Limit mismatch")
-	assert.Equal(t, uint64(0), limits.Core.Used.Load(), "Used mismatch")
-	assert.Equal(t, uint64(5000), limits.Core.Remaining.Load(), "Remaining mismatch")
-	assert.Equal(t, uint64(1745121612), limits.Core.Reset.Load(), "Reset mismatch")
+	assert.Equal(t, &Rate{
+		Limit:     5000,
+		Used:      0,
+		Remaining: 5000,
+		Reset:     1745121612,
+	}, limits.Load(ResourceCore))
 
 	err = limits.Parse(http.Header{
 		"X-Ratelimit-Limit":     []string{"invalid"},

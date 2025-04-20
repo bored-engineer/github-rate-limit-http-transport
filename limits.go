@@ -8,6 +8,8 @@ import (
 	"iter"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync"
 )
 
 // DefaultURL is the default URL used to poll rate limits.
@@ -20,98 +22,87 @@ var DefaultURL = &url.URL{
 
 // Limits represents the rate limits for all known resource types.
 type Limits struct {
-	Core                      Rate `json:"core"`
-	Search                    Rate `json:"search"`
-	GraphQL                   Rate `json:"graphql"`
-	IntegrationManifest       Rate `json:"integration_manifest"`
-	SourceImport              Rate `json:"source_import"`
-	CodeScanningUpload        Rate `json:"code_scanning_upload"`
-	CodeScanningAutofix       Rate `json:"code_scanning_autofix"`
-	ActionsRunnerRegistration Rate `json:"actions_runner_registration"`
-	SCIM                      Rate `json:"scim"`
-	DependencySnapshots       Rate `json:"dependency_snapshots"`
-	AuditLog                  Rate `json:"audit_log"`
-	AuditLogStreaming         Rate `json:"audit_log_streaming"`
-	CodeSearch                Rate `json:"code_search"`
+	m sync.Map
+	// Notify is called when a new rate limit is stored.
+	// It can be a useful hook to update metric gauges.
+	Notify func(Resource, *Rate)
 }
 
-// Rate returns the rate-limit for the given resource type.
-func (l *Limits) Rate(resource Resource) *Rate {
-	switch resource {
-	case ResourceCore:
-		return &l.Core
-	case ResourceSearch:
-		return &l.Search
-	case ResourceGraphQL:
-		return &l.GraphQL
-	case ResourceIntegrationManifest:
-		return &l.IntegrationManifest
-	case ResourceSourceImport:
-		return &l.SourceImport
-	case ResourceCodeScanningUpload:
-		return &l.CodeScanningUpload
-	case ResourceCodeScanningAutofix:
-		return &l.CodeScanningAutofix
-	case ResourceActionsRunnerRegistration:
-		return &l.ActionsRunnerRegistration
-	case ResourceSCIM:
-		return &l.SCIM
-	case ResourceDependencySnapshots:
-		return &l.DependencySnapshots
-	case ResourceAuditLog:
-		return &l.AuditLog
-	case ResourceAuditLogStreaming:
-		return &l.AuditLogStreaming
-	case ResourceCodeSearch:
-		return &l.CodeSearch
-	default:
+// UnmarshalJSON implements json.Unmarshaler.
+func (l *Limits) UnmarshalJSON(data []byte) error {
+	var resources map[Resource]Rate
+	if err := json.Unmarshal(data, &resources); err != nil {
+		return err
+	}
+	for resource, rate := range resources {
+		l.Store(resource, &rate)
+	}
+	return nil
+}
+
+// MarshalJSON implements json.Marshaler.
+func (l *Limits) MarshalJSON() ([]byte, error) {
+	resources := make(map[Resource]*Rate)
+	for resource, rate := range l.Iter() {
+		resources[resource] = rate
+	}
+	return json.Marshal(resources)
+}
+
+// Store the rate limit for the given resource type.
+func (l *Limits) Store(resource Resource, rate *Rate) {
+	l.m.Store(resource, rate)
+	if l.Notify != nil {
+		l.Notify(resource, rate)
+	}
+}
+
+// Load the rate-limit for the given resource type.
+func (l *Limits) Load(resource Resource) *Rate {
+	val, ok := l.m.Load(resource)
+	if !ok {
 		return nil
 	}
+	r, ok := val.(*Rate)
+	if !ok {
+		return nil
+	}
+	return r
 }
 
 // Iter loops over the resource types and yields each resource type and its rate limit.
 func (l *Limits) Iter() iter.Seq2[Resource, *Rate] {
 	return func(yield func(Resource, *Rate) bool) {
-		if !yield(ResourceCore, &l.Core) {
-			return
-		}
-		if !yield(ResourceSearch, &l.Search) {
-			return
-		}
-		if !yield(ResourceGraphQL, &l.GraphQL) {
-			return
-		}
-		if !yield(ResourceIntegrationManifest, &l.IntegrationManifest) {
-			return
-		}
-		if !yield(ResourceSourceImport, &l.SourceImport) {
-			return
-		}
-		if !yield(ResourceCodeScanningUpload, &l.CodeScanningUpload) {
-			return
-		}
-		if !yield(ResourceCodeScanningAutofix, &l.CodeScanningAutofix) {
-			return
-		}
-		if !yield(ResourceActionsRunnerRegistration, &l.ActionsRunnerRegistration) {
-			return
-		}
-		if !yield(ResourceSCIM, &l.SCIM) {
-			return
-		}
-		if !yield(ResourceDependencySnapshots, &l.DependencySnapshots) {
-			return
-		}
-		if !yield(ResourceAuditLog, &l.AuditLog) {
-			return
-		}
-		if !yield(ResourceAuditLogStreaming, &l.AuditLogStreaming) {
-			return
-		}
-		if !yield(ResourceCodeSearch, &l.CodeSearch) {
-			return
-		}
+		l.m.Range(func(key, value any) bool {
+			resource, ok := key.(Resource)
+			if !ok {
+				return false
+			}
+			rate, ok := value.(*Rate)
+			if !ok {
+				return false
+			}
+			return yield(resource, rate)
+		})
 	}
+}
+
+// String implements fmt.Stringer
+func (l *Limits) String() string {
+	var sb strings.Builder
+	sb.WriteString("Limits{")
+	first := true
+	for resource, rate := range l.Iter() {
+		if !first {
+			sb.WriteString(", ")
+		}
+		first = false
+		sb.WriteString(resource.String())
+		sb.WriteString(": ")
+		sb.WriteString(rate.String())
+	}
+	sb.WriteString("}")
+	return sb.String()
 }
 
 // Parse updates the rate limits based on the provided HTTP headers.
@@ -120,16 +111,17 @@ func (l *Limits) Parse(headers http.Header) error {
 	if resource == "" {
 		return nil // possibly a error or an endpoint without a rate-limit
 	}
-	rate := l.Rate(resource)
-	if rate == nil {
-		return fmt.Errorf("unknown resource type: %s", resource)
+	rate, err := ParseRate(headers)
+	if err != nil {
+		return err
 	}
-	return rate.Parse(headers)
+	l.Store(resource, &rate)
+	return nil
 }
 
-// Update fetches the latest rate limits from the GitHub API and updates the Limits instance.
+// Fetch the latest rate limits from the GitHub API and update the Limits instance.
 // If the provided URL is nil, it defaults to DefaultURL (https://api.github.com/rate_limit).
-func (l *Limits) Update(ctx context.Context, transport http.RoundTripper, u *url.URL) error {
+func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.URL) error {
 	if u == nil {
 		u = DefaultURL
 	}

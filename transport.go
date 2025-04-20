@@ -38,8 +38,8 @@ func (t *Transport) Poll(ctx context.Context, interval time.Duration, u *url.URL
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		if err := t.Limits.Update(ctx, t, u); err != nil {
-			log.Printf("(*Transport).Limits.Update failed: %v\n", err)
+		if err := t.Limits.Fetch(ctx, t, u); err != nil {
+			log.Printf("(*Transport).Limits.Fetch failed: %v\n", err)
 		}
 		select {
 		case <-ctx.Done():

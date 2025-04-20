@@ -3,7 +3,7 @@ package ghratelimit
 import (
 	"context"
 	"fmt"
-	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"time"
@@ -34,21 +34,17 @@ func (bt BalancingTransport) RoundTrip(req *http.Request) (*http.Response, error
 
 	var bestTransport *Transport
 	var bestRemaining uint64
-	for idx, transport := range bt {
-		rate := transport.Limits.Rate(resource)
-		if rate == nil {
-			return nil, fmt.Errorf("unknown resource type for transport %d: %s", idx, resource)
-		}
-		remaining := rate.Remaining.Load()
-		log.Println(idx, remaining)
-		if remaining > bestRemaining {
-			bestRemaining = remaining
-			bestTransport = transport
+	for _, transport := range bt {
+		if rate := transport.Limits.Load(resource); rate != nil {
+			if rate.Remaining > bestRemaining {
+				bestRemaining = rate.Remaining
+				bestTransport = transport
+			}
 		}
 	}
 
 	if bestTransport == nil {
-		return bt[0].RoundTrip(req)
+		return bt[rand.Intn(len(bt))].RoundTrip(req)
 	}
 	return bestTransport.RoundTrip(req)
 }
