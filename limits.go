@@ -1,4 +1,4 @@
-package ghtransport
+package ghratelimit
 
 import (
 	"context"
