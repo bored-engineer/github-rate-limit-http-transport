@@ -7,38 +7,39 @@ import (
 
 // InferResource guessed which rate-limit resource that will be consumed by the provided HTTP request.
 func InferResource(req *http.Request) Resource {
+	path := strings.TrimPrefix(req.URL.Path, "/api/v3")
 	switch {
-	case strings.HasPrefix(req.URL.Path, "/search/"):
-		if req.URL.Path == "/search/code" {
+	case strings.HasPrefix(path, "/search/"):
+		if path == "/search/code" {
 			return ResourceCodeSearch
 		}
 		return ResourceSearch
-	case req.URL.Path == "/graphql":
+	case path == "/graphql":
 		return ResourceGraphQL
-	case strings.HasPrefix(req.URL.Path, "/app-manifests/"):
+	case strings.HasPrefix(path, "/app-manifests/"):
 		return ResourceIntegrationManifest
-	case strings.HasPrefix(req.URL.Path, "/repos/") &&
-		strings.HasSuffix(req.URL.Path, "/code-scanning/sarifs") &&
+	case strings.HasPrefix(path, "/repos/") &&
+		strings.HasSuffix(path, "/code-scanning/sarifs") &&
 		req.Method == http.MethodPost:
 		return ResourceCodeScanningUpload
-	case strings.HasPrefix(req.URL.Path, "/repos/") &&
-		strings.Contains(req.URL.Path, "/code-scanning/alerts/") &&
-		strings.HasSuffix(req.URL.Path, "/autofix") &&
+	case strings.HasPrefix(path, "/repos/") &&
+		strings.Contains(path, "/code-scanning/alerts/") &&
+		strings.HasSuffix(path, "/autofix") &&
 		req.Method == http.MethodPost:
 		return ResourceCodeScanningAutofix
-	case strings.HasPrefix(req.URL.Path, "/actions/runners/registration-token") &&
+	case strings.HasPrefix(path, "/actions/runners/registration-token") &&
 		req.Method == http.MethodPost:
 		return ResourceActionsRunnerRegistration
-	case strings.HasPrefix(req.URL.Path, "/scim/v2/"):
+	case strings.HasPrefix(path, "/scim/v2/"):
 		return ResourceSCIM
-	case strings.HasPrefix(req.URL.Path, "/repos/") &&
-		strings.Contains(req.URL.Path, "/dependency-graph/"):
+	case strings.HasPrefix(path, "/repos/") &&
+		strings.Contains(path, "/dependency-graph/"):
 		return ResourceDependencySnapshots
-	case (strings.HasPrefix(req.URL.Path, "/enterprises/") ||
-		strings.HasPrefix(req.URL.Path, "/organizations/")) && strings.HasSuffix(req.URL.Path, "/audit-log"):
+	case (strings.HasPrefix(path, "/enterprises/") ||
+		strings.HasPrefix(path, "/organizations/")) && strings.HasSuffix(path, "/audit-log"):
 		return ResourceAuditLog
-	case (strings.HasPrefix(req.URL.Path, "/enterprises/") ||
-		strings.HasPrefix(req.URL.Path, "/organizations/")) && strings.Contains(req.URL.Path, "/audit-log/streams"):
+	case (strings.HasPrefix(path, "/enterprises/") ||
+		strings.HasPrefix(path, "/organizations/")) && strings.Contains(path, "/audit-log/streams"):
 		return ResourceAuditLogStreaming
 	}
 
