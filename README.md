@@ -2,7 +2,7 @@
 A Golang [http.RoundTripper](https://pkg.go.dev/net/http#RoundTripper) for monitoring the [GitHub rate-limit responses](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api?apiVersion=2022-11-28) from GitHub's REST API.
 
 ## Example
-Demonstrates how to use [*ghratelimit.Transport](https://pkg.go.dev/github.com/bored-engineer/github-rate-limit-http-transport#Transport) with [go-github](github.com/google/go-github) and [Prometheus](github.com/prometheus/client_golang) to monitor GitHub rate limits:
+Demonstrates how to use [ghratelimit.Transport](https://pkg.go.dev/github.com/bored-engineer/github-rate-limit-http-transport#Transport) with [go-github](github.com/google/go-github) and [Prometheus](github.com/prometheus/client_golang) to monitor GitHub rate limits:
 ```go
 package main
 
@@ -84,5 +84,6 @@ func main() {
 	// Wait for the context to be cancelled before exiting
 	<-ctx.Done()
 }
-
 ```
+
+Additionally, the [ghratelimit.BalancingTransport](https://pkg.go.dev/github.com/bored-engineer/github-rate-limit-http-transport#BalancingTransport) can be used to automatically balance requests across multiple [ghratelimit.Transport](https://pkg.go.dev/github.com/bored-engineer/github-rate-limit-http-transport#Transport) instances (presumably backed by different GitHub credentials) based on whichever transport has the highest remaining GitHub rate-limit.
