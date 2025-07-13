@@ -26,7 +26,7 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 		resp, err = t.Base.RoundTrip(req)
 	}
 	if resp != nil {
-		if err := t.Limits.Parse(resp.Header); err != nil {
+		if err := t.Limits.Parse(resp); err != nil {
 			return nil, err
 		}
 	}
@@ -39,7 +39,7 @@ func (t *Transport) Poll(ctx context.Context, interval time.Duration, u *url.URL
 	defer ticker.Stop()
 	for {
 		if err := t.Limits.Fetch(ctx, t, u); err != nil {
-			log.Printf("(*Transport).Limits.Fetch failed: %v\n", err)
+			log.Printf("(*ghratelimit.Transport).Limits.Fetch failed: %v\n", err)
 		}
 		select {
 		case <-ctx.Done():

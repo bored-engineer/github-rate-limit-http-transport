@@ -99,12 +99,16 @@ const limitsResponse = `{
   }
 }`
 
-func TestLimits_UnmarshalJSON(t *testing.T) {
+func TestLimits_Store(t *testing.T) {
 	var resp struct {
-		Resources Limits `json:"resources"`
+		Resources map[Resource]Rate `json:"resources"`
 	}
 	err := json.Unmarshal([]byte(limitsResponse), &resp)
 	assert.NoError(t, err, "json.Unmarshal failed")
+	var limits Limits
+	for resource, rate := range resp.Resources {
+		limits.Store(nil, resource, &rate)
+	}
 	assert.Equal(t, map[Resource]*Rate{
 		ResourceCore:                      {Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612},
 		ResourceSearch:                    {Limit: 30, Used: 0, Remaining: 30, Reset: 1745118072},
@@ -119,17 +123,19 @@ func TestLimits_UnmarshalJSON(t *testing.T) {
 		ResourceAuditLog:                  {Limit: 1750, Used: 0, Remaining: 1750, Reset: 1745121612},
 		ResourceAuditLogStreaming:         {Limit: 15, Used: 0, Remaining: 15, Reset: 1745121612},
 		ResourceCodeSearch:                {Limit: 10, Used: 0, Remaining: 10, Reset: 1745118072},
-	}, maps.Collect(resp.Resources.Iter()))
+	}, maps.Collect(limits.Iter()))
 }
 
 func TestLimits_Parse(t *testing.T) {
 	var limits Limits
-	err := limits.Parse(http.Header{
-		"X-Ratelimit-Limit":     []string{"5000"},
-		"X-Ratelimit-Used":      []string{"0"},
-		"X-Ratelimit-Remaining": []string{"5000"},
-		"X-Ratelimit-Reset":     []string{"1745121612"},
-		"X-Ratelimit-Resource":  []string{"core"},
+	err := limits.Parse(&http.Response{
+		Header: http.Header{
+			"X-Ratelimit-Limit":     []string{"5000"},
+			"X-Ratelimit-Used":      []string{"0"},
+			"X-Ratelimit-Remaining": []string{"5000"},
+			"X-Ratelimit-Reset":     []string{"1745121612"},
+			"X-Ratelimit-Resource":  []string{"core"},
+		},
 	})
 	assert.NoError(t, err, "(*Limits).Parse failed")
 	assert.Equal(t, &Rate{
@@ -139,12 +145,14 @@ func TestLimits_Parse(t *testing.T) {
 		Reset:     1745121612,
 	}, limits.Load(ResourceCore))
 
-	err = limits.Parse(http.Header{
-		"X-Ratelimit-Limit":     []string{"invalid"},
-		"X-Ratelimit-Used":      []string{"invalid"},
-		"X-Ratelimit-Remaining": []string{"invalid"},
-		"X-Ratelimit-Reset":     []string{"invalid"},
-		"X-Ratelimit-Resource":  []string{"invalid"},
+	err = limits.Parse(&http.Response{
+		Header: http.Header{
+			"X-Ratelimit-Limit":     []string{"invalid"},
+			"X-Ratelimit-Used":      []string{"invalid"},
+			"X-Ratelimit-Remaining": []string{"invalid"},
+			"X-Ratelimit-Reset":     []string{"invalid"},
+			"X-Ratelimit-Resource":  []string{"invalid"},
+		},
 	})
 	assert.Error(t, err, "expected error, got nil")
 }

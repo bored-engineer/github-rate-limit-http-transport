@@ -53,7 +53,7 @@ func main() {
 	transport := &ghratelimit.Transport{
 		Base: http.DefaultTransport,
 		Limits: ghratelimit.Limits{
-			Notify: func(resource ghratelimit.Resource, rate *ghratelimit.Rate) {
+			Notify: func(resp *http.Response, resource ghratelimit.Resource, rate *ghratelimit.Rate) {
 				RateLimitRemaining.WithLabelValues(resource.String()).Set(float64(rate.Remaining))
 				RateLimitReset.WithLabelValues(resource.String()).Set(float64(rate.Reset))
 			},

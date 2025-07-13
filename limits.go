@@ -25,35 +25,14 @@ type Limits struct {
 	m sync.Map
 	// Notify is called when a new rate limit is stored.
 	// It can be a useful hook to update metric gauges.
-	Notify func(Resource, *Rate)
-}
-
-// UnmarshalJSON implements json.Unmarshaler.
-func (l *Limits) UnmarshalJSON(data []byte) error {
-	var resources map[Resource]Rate
-	if err := json.Unmarshal(data, &resources); err != nil {
-		return err
-	}
-	for resource, rate := range resources {
-		l.Store(resource, &rate)
-	}
-	return nil
-}
-
-// MarshalJSON implements json.Marshaler.
-func (l *Limits) MarshalJSON() ([]byte, error) {
-	resources := make(map[Resource]*Rate)
-	for resource, rate := range l.Iter() {
-		resources[resource] = rate
-	}
-	return json.Marshal(resources)
+	Notify func(*http.Response, Resource, *Rate)
 }
 
 // Store the rate limit for the given resource type.
-func (l *Limits) Store(resource Resource, rate *Rate) {
+func (l *Limits) Store(resp *http.Response, resource Resource, rate *Rate) {
 	l.m.Store(resource, rate)
 	if l.Notify != nil {
-		l.Notify(resource, rate)
+		l.Notify(resp, resource, rate)
 	}
 }
 
@@ -105,17 +84,17 @@ func (l *Limits) String() string {
 	return sb.String()
 }
 
-// Parse updates the rate limits based on the provided HTTP headers.
-func (l *Limits) Parse(headers http.Header) error {
-	resource := ParseResource(headers)
+// Parse updates the rate limits based on the provided HTTP response.
+func (l *Limits) Parse(resp *http.Response) error {
+	resource := ParseResource(resp.Header)
 	if resource == "" {
 		return nil // possibly a error or an endpoint without a rate-limit
 	}
-	rate, err := ParseRate(headers)
+	rate, err := ParseRate(resp.Header)
 	if err != nil {
 		return err
 	}
-	l.Store(resource, &rate)
+	l.Store(resp, resource, &rate)
 	return nil
 }
 
@@ -129,6 +108,7 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	if err != nil {
 		return fmt.Errorf("http.NewRequestWithContext for %q failed: %w", u, err)
 	}
+	req.Header.Set("User-Agent", "github.com/bored-engineer/github-auth-http-transport")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
 	resp, err := transport.RoundTrip(req)
@@ -146,15 +126,19 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("(http.RoundTripper).RoundTrip for %q failed (%d): %s", u, resp.StatusCode, string(body))
+		return fmt.Errorf("(*http.Response).StatusCode(%d) != 200 for %q: %s", resp.StatusCode, u, string(body))
 	}
 
-	if err := json.Unmarshal(body, &struct {
-		Resources *Limits `json:"resources"`
-	}{
-		Resources: l,
-	}); err != nil {
+	var limits struct {
+		Resources map[Resource]Rate `json:"resources"`
+	}
+
+	if err := json.Unmarshal(body, &limits); err != nil {
 		return fmt.Errorf("json.Unmarshal for %q failed: %w", u, err)
+	}
+
+	for resource, rate := range limits.Resources {
+		l.Store(resp, resource, &rate)
 	}
 
 	return nil
