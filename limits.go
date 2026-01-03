@@ -108,7 +108,7 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	if err != nil {
 		return fmt.Errorf("http.NewRequestWithContext for %q failed: %w", u, err)
 	}
-	req.Header.Set("User-Agent", "github.com/bored-engineer/github-auth-http-transport")
+	req.Header.Set("User-Agent", "github.com/bored-engineer/github-rate-limit-http-transport")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
 	resp, err := transport.RoundTrip(req)
