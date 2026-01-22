@@ -70,20 +70,54 @@ func (bt *BalancingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 }
 
 // StrategyMostRemaining selects the transport with the highest remaining rate limit.
-func StrategyMostRemaining(resource Resource, currentBest, candidate *Transport) *Transport {
-	var currentRem, candidateRem uint64
-	if currentBest != nil {
-		if rate := currentBest.Limits.Load(resource); rate != nil {
-			currentRem = rate.Remaining
-		}
-	}
+func StrategyMostRemaining(resource Resource, best, candidate *Transport) *Transport {
+	bestRem, _ := extractValues(resource, best)
+	candidateRem, _ := extractValues(resource, candidate)
 
-	if rate := candidate.Limits.Load(resource); rate != nil {
-		candidateRem = rate.Remaining
-	}
-
-	if candidateRem > currentRem {
+	if candidateRem > bestRem {
 		return candidate
 	}
-	return currentBest
+	return best
+}
+
+func StrategyResetTimeInPastAndMostRemaining(resource Resource, best, candidate *Transport) *Transport {
+	bestRem, bestReset := extractValues(resource, best)
+	candidateRem, candidateReset := extractValues(resource, candidate)
+	if candidate != nil {
+		if cRate := candidate.Limits.Load(resource); cRate != nil {
+			candidateRem = cRate.Remaining
+			candidateReset = time.Unix(int64(cRate.Reset), 0)
+		}
+	}
+	// if both are zero remaining, return nil to indicate no best transport
+	if bestRem == 0 && candidateRem == 0 {
+		return nil
+	}
+	// prefer the one that is already reset because it can serve more requests now
+	if isTimeANonZeroAndBeforeNowAndB(candidateReset, bestReset) {
+		return candidate
+	}
+	if isTimeANonZeroAndBeforeNowAndB(bestReset, candidateReset) {
+		return best
+	}
+	// Otherwise, prefer the non-zero remaining that resets sooner, or the higher remaining if both reset at the same time
+	if (candidateReset.Before(bestReset) && candidateRem > 0) || candidateRem > bestRem {
+		return candidate
+	}
+	return best
+}
+
+func extractValues(resource Resource, t *Transport) (uint64, time.Time) {
+	if t != nil {
+		if r := t.Limits.Load(resource); r != nil {
+			currentRem := r.Remaining
+			currentReset := time.Unix(int64(r.Reset), 0)
+			return currentRem, currentReset
+		}
+	}
+	return 0, time.Time{}
+}
+
+func isTimeANonZeroAndBeforeNowAndB(a, b time.Time) bool {
+	return !a.IsZero() && a.Before(time.Now()) && a.Before(b)
 }

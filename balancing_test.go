@@ -245,3 +245,157 @@ func TestNewBalancingTransport(t *testing.T) {
 
 // Ensure mockRoundTripper implements http.RoundTripper
 var _ http.RoundTripper = &mockRoundTripper{}
+
+func TestStrategy_BestTransportByRemainingAndReset(t *testing.T) {
+	now := time.Now()
+	past := now.Add(-1 * time.Hour)
+	future := now.Add(1 * time.Hour)
+	olderPast := now.Add(-2 * time.Hour)
+
+	tests := []struct {
+		name          string
+		bestRate      *Rate
+		candidateRate *Rate
+		wantCandidate bool
+		wantNil       bool
+	}{
+		{
+			name:          "best is nil (implied by execution flow usually, but simulated here via empty bestRate or just checking logic flow)",
+			bestRate:      nil, // Treat as nil transport or nil constants
+			candidateRate: &Rate{Remaining: 10, Reset: uint64(future.Unix())},
+			wantCandidate: true,
+		},
+		{
+			name:          "both future, candidate has more remaining",
+			bestRate:      &Rate{Remaining: 10, Reset: uint64(future.Unix())},
+			candidateRate: &Rate{Remaining: 20, Reset: uint64(future.Unix())},
+			wantCandidate: true,
+		},
+		{
+			name:          "both future, best has more remaining",
+			bestRate:      &Rate{Remaining: 20, Reset: uint64(future.Unix())},
+			candidateRate: &Rate{Remaining: 10, Reset: uint64(future.Unix())},
+			wantCandidate: false,
+		},
+		{
+			name:          "candidate reset in past, best in future",
+			bestRate:      &Rate{Remaining: 100, Reset: uint64(future.Unix())},
+			candidateRate: &Rate{Remaining: 0, Reset: uint64(past.Unix())}, // Even with 0 remaining, if reset is past, it might be preferred?
+			// Logic: candidateReset (past) < now AND candidateReset < currentReset (future). True.
+			wantCandidate: true,
+		},
+		{
+			name:          "best reset in past, candidate in future",
+			bestRate:      &Rate{Remaining: 0, Reset: uint64(past.Unix())},
+			candidateRate: &Rate{Remaining: 100, Reset: uint64(future.Unix())},
+			// Logic: candidate (future) < now is False.
+			// current (past) < now is True. current (past) < candidate (future) True.
+			wantCandidate: false, // returns best
+		},
+		{
+			name:          "both in past, candidate is older",
+			bestRate:      &Rate{Remaining: 0, Reset: uint64(past.Unix())},
+			candidateRate: &Rate{Remaining: 0, Reset: uint64(olderPast.Unix())},
+			wantNil:       true,
+		},
+		{
+			name:          "both in past, best is older",
+			bestRate:      &Rate{Remaining: 0, Reset: uint64(olderPast.Unix())},
+			candidateRate: &Rate{Remaining: 0, Reset: uint64(past.Unix())},
+			wantNil:       true,
+		},
+		{
+			name:          "best is nil, candidate has 0 remaining and future reset",
+			bestRate:      nil,
+			candidateRate: &Rate{Remaining: 0, Reset: uint64(future.Unix())},
+			wantNil:       true,
+		},
+		{
+			name:          "both zero remaining and future resets",
+			bestRate:      &Rate{Remaining: 0, Reset: uint64(future.Unix())},
+			candidateRate: &Rate{Remaining: 0, Reset: uint64(future.Unix())},
+			wantNil:       true,
+		},
+		{
+			name:          "candidate reset in past, best in future (non-zero remaining)",
+			bestRate:      &Rate{Remaining: 100, Reset: uint64(future.Unix())},
+			candidateRate: &Rate{Remaining: 50, Reset: uint64(past.Unix())},
+			wantCandidate: true,
+		},
+		{
+			name:          "best reset in past, candidate in future (non-zero remaining)",
+			bestRate:      &Rate{Remaining: 50, Reset: uint64(past.Unix())},
+			candidateRate: &Rate{Remaining: 75, Reset: uint64(future.Unix())},
+			wantCandidate: false,
+		},
+		{
+			name:          "both in past, candidate is older (non-zero remaining)",
+			bestRate:      &Rate{Remaining: 30, Reset: uint64(past.Unix())},
+			candidateRate: &Rate{Remaining: 40, Reset: uint64(olderPast.Unix())},
+			wantCandidate: true,
+		},
+		{
+			name:          "both in past, best is older (non-zero remaining)",
+			bestRate:      &Rate{Remaining: 40, Reset: uint64(olderPast.Unix())},
+			candidateRate: &Rate{Remaining: 30, Reset: uint64(past.Unix())},
+			wantCandidate: false,
+		},
+		{
+			name:          "best is nil, candidate has remaining and future reset",
+			bestRate:      nil,
+			candidateRate: &Rate{Remaining: 25, Reset: uint64(future.Unix())},
+			wantCandidate: true,
+		},
+		{
+			name:          "both non-zero remaining and future resets",
+			bestRate:      &Rate{Remaining: 25, Reset: uint64(future.Unix())},
+			candidateRate: &Rate{Remaining: 50, Reset: uint64(future.Unix())},
+			wantCandidate: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var best, candidate *Transport
+
+			if tt.bestRate != nil {
+				best = NewTransport(nil)
+				best.Limits.Store(nil, ResourceCore, tt.bestRate)
+			}
+			// If bestRate is nil, best stays nil, simulating first iteration or explicit nil
+
+			if tt.candidateRate != nil {
+				candidate = NewTransport(nil)
+				candidate.Limits.Store(nil, ResourceCore, tt.candidateRate)
+			} else {
+				// Candidate usually surely exists in the loop but for completeness
+				candidate = NewTransport(nil)
+			}
+
+			// If we passed nil bestRate to simulate "no current best", we pass nil to function
+			var bestArg *Transport
+			if tt.bestRate != nil {
+				bestArg = best
+			}
+
+			got := StrategyResetTimeInPastAndMostRemaining(ResourceCore, bestArg, candidate)
+
+			if tt.wantNil {
+				if got != nil {
+					t.Errorf("wanted nil, got non-nil")
+				}
+				return
+			}
+
+			if tt.wantCandidate {
+				if got != candidate {
+					t.Errorf("wanted candidate, got best")
+				}
+			} else {
+				if got != bestArg {
+					t.Errorf("wanted best, got candidate")
+				}
+			}
+		})
+	}
+}
