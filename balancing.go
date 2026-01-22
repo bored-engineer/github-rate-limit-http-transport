@@ -70,6 +70,7 @@ func (bt *BalancingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 }
 
 // StrategyMostRemaining selects the transport with the highest remaining rate limit.
+// Uses only one lookup per transport and avoids time conversions to minimize overhead.
 func StrategyMostRemaining(resource Resource, best, candidate *Transport) *Transport {
 	bestRem, _ := extractValues(resource, best)
 	candidateRem, _ := extractValues(resource, candidate)
@@ -80,44 +81,56 @@ func StrategyMostRemaining(resource Resource, best, candidate *Transport) *Trans
 	return best
 }
 
+// StrategyResetTimeInPastAndMostRemaining prefers transports whose reset is already in the past,
+// then earlier resets, and finally the one with the most remaining tokens. Returns nil when both// transports have zero remaining, signaling no immediate capacity.
 func StrategyResetTimeInPastAndMostRemaining(resource Resource, best, candidate *Transport) *Transport {
 	bestRem, bestReset := extractValues(resource, best)
 	candidateRem, candidateReset := extractValues(resource, candidate)
-	if candidate != nil {
-		if cRate := candidate.Limits.Load(resource); cRate != nil {
-			candidateRem = cRate.Remaining
-			candidateReset = time.Unix(int64(cRate.Reset), 0)
-		}
-	}
-	// if both are zero remaining, return nil to indicate no best transport
+
+	// Fast path: both have zero remaining, no usable transport right now.
 	if bestRem == 0 && candidateRem == 0 {
 		return nil
 	}
-	// prefer the one that is already reset because it can serve more requests now
-	if isTimeANonZeroAndBeforeNowAndB(candidateReset, bestReset) {
+
+	// If one transport has already reset (reset time in the past) and the other hasn't,
+	// prefer the one that reset first because it can serve immediately.
+	if resetIsInPastAndEarlierThanOther(candidateReset, bestReset) {
 		return candidate
 	}
-	if isTimeANonZeroAndBeforeNowAndB(bestReset, candidateReset) {
+	if resetIsInPastAndEarlierThanOther(bestReset, candidateReset) {
 		return best
 	}
-	// Otherwise, prefer the non-zero remaining that resets sooner, or the higher remaining if both reset at the same time
-	if (candidateReset.Before(bestReset) && candidateRem > 0) || candidateRem > bestRem {
+
+	// When both resets are in the future (or zero), prefer the earlier reset if it also has capacity.
+	if candidateReset != 0 && bestReset != 0 {
+		if candidateReset < bestReset && candidateRem > 0 {
+			return candidate
+		}
+		if bestReset < candidateReset && bestRem > 0 {
+			return best
+		}
+	}
+
+	// Fallback to the transport with more remaining tokens.
+	if candidateRem > bestRem {
 		return candidate
 	}
 	return best
 }
 
-func extractValues(resource Resource, t *Transport) (uint64, time.Time) {
+// extractValues reads remaining tokens and reset epoch seconds for a transport.
+// Returns zero values when the transport or limit is missing (no allocation occurs).
+func extractValues(resource Resource, t *Transport) (uint64, int64) {
 	if t != nil {
 		if r := t.Limits.Load(resource); r != nil {
-			currentRem := r.Remaining
-			currentReset := time.Unix(int64(r.Reset), 0)
-			return currentRem, currentReset
+			return r.Remaining, int64(r.Reset)
 		}
 	}
-	return 0, time.Time{}
+	return 0, 0
 }
 
-func isTimeANonZeroAndBeforeNowAndB(a, b time.Time) bool {
-	return !a.IsZero() && a.Before(time.Now()) && a.Before(b)
+// resetIsInPastAndEarlierThanOther returns true when `reset` is non-zero, already in the past
+// relative to `now`, and either the other reset is zero or occurs later.
+func resetIsInPastAndEarlierThanOther(reset, otherReset int64) bool {
+	return reset != 0 && reset < time.Now().Unix() && (otherReset == 0 || reset < otherReset)
 }

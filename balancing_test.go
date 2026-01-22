@@ -352,6 +352,18 @@ func TestStrategy_BestTransportByRemainingAndReset(t *testing.T) {
 			candidateRate: &Rate{Remaining: 50, Reset: uint64(future.Unix())},
 			wantCandidate: true,
 		},
+		{
+			name:          "both future, candidate resets sooner with capacity",
+			bestRate:      &Rate{Remaining: 10, Reset: uint64(future.Add(30 * time.Minute).Unix())},
+			candidateRate: &Rate{Remaining: 5, Reset: uint64(future.Unix())},
+			wantCandidate: true,
+		},
+		{
+			name:          "both future, best resets sooner with capacity",
+			bestRate:      &Rate{Remaining: 5, Reset: uint64(future.Unix())},
+			candidateRate: &Rate{Remaining: 10, Reset: uint64(future.Add(30 * time.Minute).Unix())},
+			wantCandidate: false,
+		},
 	}
 
 	for _, tt := range tests {
