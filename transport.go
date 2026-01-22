@@ -18,6 +18,27 @@ type Transport struct {
 	Limits Limits
 }
 
+// Option configures the Transport
+type Option func(*Transport)
+
+// NewTransport creates new Transport with the provided options.
+func NewTransport(base http.RoundTripper, opts ...Option) *Transport {
+	t := &Transport{
+		Base: base,
+	}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
+}
+
+// WithNotifyCallback configures the callback to be called when a new rate limit is stored.
+func WithNotifyCallback(callback func(*http.Response, Resource, *Rate)) Option {
+	return func(t *Transport) {
+		t.Limits.Notify = callback
+	}
+}
+
 // RoundTrip implements http.RoundTripper
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	if t.Base == nil {
@@ -30,7 +51,7 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			return nil, err
 		}
 	}
-	return
+	return resp, err
 }
 
 // Poll calls (*Transport).Limits.Update every interval, starting immediately.

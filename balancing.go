@@ -11,19 +11,44 @@ import (
 
 // BalancingTransport distributes requests to the transport with the highest "remaining" rate limit to execute the request.
 // This can be used to distributes requests across multiple GitHub authentication tokens or applications.
-type BalancingTransport []*Transport
+type BalancingTransport struct {
+	transports []*Transport
+	strategy   func(resource Resource, currentBest *Transport, candidate *Transport) *Transport
+}
+
+// BalancingOption configures the BalancingTransport
+type BalancingOption func(*BalancingTransport)
+
+// NewBalancingTransport creates a new BalancingTransport with the provided transports and options.
+func NewBalancingTransport(transports []*Transport, opts ...BalancingOption) *BalancingTransport {
+	bt := &BalancingTransport{
+		transports: transports,
+		strategy:   StrategyMostRemaining,
+	}
+	for _, opt := range opts {
+		opt(bt)
+	}
+	return bt
+}
+
+// WithStrategy configures the strategy used to select the best transport.
+func WithStrategy(strategy func(resource Resource, currentBest *Transport, candidate *Transport) *Transport) BalancingOption {
+	return func(bt *BalancingTransport) {
+		bt.strategy = strategy
+	}
+}
 
 // Poll calls (*Transport).Poll for every transport
-func (bt BalancingTransport) Poll(ctx context.Context, interval time.Duration, u *url.URL) {
-	for _, transport := range bt {
+func (bt *BalancingTransport) Poll(ctx context.Context, interval time.Duration, u *url.URL) {
+	for _, transport := range bt.transports {
 		go transport.Poll(ctx, interval, u)
 	}
 	<-ctx.Done()
 }
 
 // RoundTrip implements http.RoundTripper
-func (bt BalancingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if len(bt) == 0 {
+func (bt *BalancingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if len(bt.transports) == 0 {
 		return nil, fmt.Errorf("no transports available")
 	}
 
@@ -33,18 +58,32 @@ func (bt BalancingTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 
 	var bestTransport *Transport
-	var bestRemaining uint64
-	for _, transport := range bt {
-		if rate := transport.Limits.Load(resource); rate != nil {
-			if rate.Remaining > bestRemaining {
-				bestRemaining = rate.Remaining
-				bestTransport = transport
-			}
-		}
+	for _, t := range bt.transports {
+		bestTransport = bt.strategy(resource, bestTransport, t)
 	}
 
 	if bestTransport == nil {
-		return bt[rand.Intn(len(bt))].RoundTrip(req)
+		bestTransport = bt.transports[rand.Intn(len(bt.transports))]
 	}
+
 	return bestTransport.RoundTrip(req)
+}
+
+// StrategyMostRemaining selects the transport with the highest remaining rate limit.
+func StrategyMostRemaining(resource Resource, currentBest, candidate *Transport) *Transport {
+	var currentRem, candidateRem uint64
+	if currentBest != nil {
+		if rate := currentBest.Limits.Load(resource); rate != nil {
+			currentRem = rate.Remaining
+		}
+	}
+
+	if rate := candidate.Limits.Load(resource); rate != nil {
+		candidateRem = rate.Remaining
+	}
+
+	if candidateRem > currentRem {
+		return candidate
+	}
+	return currentBest
 }
