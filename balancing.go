@@ -3,6 +3,7 @@ package ghratelimit
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -76,8 +77,11 @@ func StrategyMostRemaining(resource Resource, best, candidate *Transport) *Trans
 	candidateRem, _ := extractValues(resource, candidate)
 
 	if candidateRem > bestRem {
+		logStrategyDecision("most_remaining", "candidate has more remaining", bestRem, 0, candidateRem, 0)
 		return candidate
 	}
+
+	logStrategyDecision("most_remaining", "keeping current best (greater or equal remaining)", bestRem, 0, candidateRem, 0)
 	return best
 }
 
@@ -89,32 +93,40 @@ func StrategyResetTimeInPastAndMostRemaining(resource Resource, best, candidate 
 
 	// Fast path: both have zero remaining, no usable transport right now.
 	if bestRem == 0 && candidateRem == 0 {
+		logStrategyDecision("reset_time_in_past_and_most_remaining", "both have zero remaining; returning nil", bestRem, bestReset, candidateRem, candidateReset)
 		return nil
 	}
 
 	// If one transport has already reset (reset time in the past) and the other hasn't,
 	// prefer the one that reset first because it can serve immediately.
 	if resetIsInPastAndEarlierThanOther(candidateReset, bestReset) {
+		logStrategyDecision("reset_time_in_past_and_most_remaining", "candidate reset is earlier and already past", bestRem, bestReset, candidateRem, candidateReset)
 		return candidate
 	}
 	if resetIsInPastAndEarlierThanOther(bestReset, candidateReset) {
+		logStrategyDecision("reset_time_in_past_and_most_remaining", "best reset is earlier and already past", bestRem, bestReset, candidateRem, candidateReset)
 		return best
 	}
 
 	// When both resets are in the future (or zero), prefer the earlier reset if it also has capacity.
 	if candidateReset != 0 && bestReset != 0 {
 		if candidateReset < bestReset && candidateRem > 0 {
+			logStrategyDecision("reset_time_in_past_and_most_remaining", "both in future; candidate resets sooner with capacity", bestRem, bestReset, candidateRem, candidateReset)
 			return candidate
 		}
 		if bestReset < candidateReset && bestRem > 0 {
+			logStrategyDecision("reset_time_in_past_and_most_remaining", "both in future; best resets sooner with capacity", bestRem, bestReset, candidateRem, candidateReset)
 			return best
 		}
 	}
 
 	// Fallback to the transport with more remaining tokens.
 	if candidateRem > bestRem {
+		logStrategyDecision("reset_time_in_past_and_most_remaining", "candidate has more remaining; fallback path", bestRem, bestReset, candidateRem, candidateReset)
 		return candidate
 	}
+
+	logStrategyDecision("reset_time_in_past_and_most_remaining", "keeping current best; candidate not better", bestRem, bestReset, candidateRem, candidateReset)
 	return best
 }
 
@@ -133,4 +145,10 @@ func extractValues(resource Resource, t *Transport) (uint64, int64) {
 // relative to `now`, and either the other reset is zero or occurs later.
 func resetIsInPastAndEarlierThanOther(reset, otherReset int64) bool {
 	return reset != 0 && reset < time.Now().Unix() && (otherReset == 0 || reset < otherReset)
+}
+
+// logStrategyDecision emits debug information for strategy choices. Kept lightweight to minimize
+// overhead; callers pass already-read values to avoid extra lookups.
+func logStrategyDecision(strategy, reason string, bestRem uint64, bestReset int64, candidateRem uint64, candidateReset int64) {
+	log.Printf("[strategy=%s] %s bestRemaining=%d bestReset=%d candidateRemaining=%d candidateReset=%d", strategy, reason, bestRem, bestReset, candidateRem, candidateReset)
 }
