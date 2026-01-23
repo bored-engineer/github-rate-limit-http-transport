@@ -3,18 +3,27 @@ package ghratelimit
 import (
 	"context"
 	"fmt"
-	"log"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"time"
 )
 
+// TransportsExhaustedError allows callers to receive the earliest reset time when all transports are exhausted.
+type TransportsExhaustedError interface {
+	error
+	SetEarliestReset(time.Time)
+	GetEarliestReset() time.Time
+	Is(error) bool
+	As(any) bool
+}
+
 // BalancingTransport distributes requests to the transport with the highest "remaining" rate limit to execute the request.
 // This can be used to distributes requests across multiple GitHub authentication tokens or applications.
 type BalancingTransport struct {
-	transports []*Transport
-	strategy   func(resource Resource, currentBest *Transport, candidate *Transport) *Transport
+	transports   []*Transport
+	strategy     func(resource Resource, currentBest *Transport, candidate *Transport) *Transport
+	exhaustedErr TransportsExhaustedError // returned when strategy yields nil and WithErrorOnTransportsExhausted is set
 }
 
 // BalancingOption configures the BalancingTransport
@@ -36,6 +45,13 @@ func NewBalancingTransport(transports []*Transport, opts ...BalancingOption) *Ba
 func WithStrategy(strategy func(resource Resource, currentBest *Transport, candidate *Transport) *Transport) BalancingOption {
 	return func(bt *BalancingTransport) {
 		bt.strategy = strategy
+	}
+}
+
+// WithErrorOnTransportsExhausted configures an error to return when the strategy cannot select a viable transport.
+func WithErrorOnTransportsExhausted(err TransportsExhaustedError) BalancingOption {
+	return func(bt *BalancingTransport) {
+		bt.exhaustedErr = err
 	}
 }
 
@@ -64,6 +80,10 @@ func (bt *BalancingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 
 	if bestTransport == nil {
+		if bt.exhaustedErr != nil {
+			bt.exhaustedErr.SetEarliestReset(earliestResetTime(resource, bt.transports))
+			return nil, bt.exhaustedErr
+		}
 		bestTransport = bt.transports[rand.Intn(len(bt.transports))]
 	}
 
@@ -77,11 +97,9 @@ func StrategyMostRemaining(resource Resource, best, candidate *Transport) *Trans
 	candidateRem, _ := extractValues(resource, candidate)
 
 	if candidateRem > bestRem {
-		logStrategyDecision("most_remaining", "candidate has more remaining", bestRem, 0, candidateRem, 0)
 		return candidate
 	}
 
-	logStrategyDecision("most_remaining", "keeping current best (greater or equal remaining)", bestRem, 0, candidateRem, 0)
 	return best
 }
 
@@ -93,40 +111,33 @@ func StrategyResetTimeInPastAndMostRemaining(resource Resource, best, candidate 
 
 	// Fast path: both have zero remaining, no usable transport right now.
 	if bestRem == 0 && candidateRem == 0 {
-		logStrategyDecision("reset_time_in_past_and_most_remaining", "both have zero remaining; returning nil", bestRem, bestReset, candidateRem, candidateReset)
 		return nil
 	}
 
 	// If one transport has already reset (reset time in the past) and the other hasn't,
 	// prefer the one that reset first because it can serve immediately.
 	if resetIsInPastAndEarlierThanOther(candidateReset, bestReset) {
-		logStrategyDecision("reset_time_in_past_and_most_remaining", "candidate reset is earlier and already past", bestRem, bestReset, candidateRem, candidateReset)
 		return candidate
 	}
 	if resetIsInPastAndEarlierThanOther(bestReset, candidateReset) {
-		logStrategyDecision("reset_time_in_past_and_most_remaining", "best reset is earlier and already past", bestRem, bestReset, candidateRem, candidateReset)
 		return best
 	}
 
 	// When both resets are in the future (or zero), prefer the earlier reset if it also has capacity.
 	if candidateReset != 0 && bestReset != 0 {
 		if candidateReset < bestReset && candidateRem > 0 {
-			logStrategyDecision("reset_time_in_past_and_most_remaining", "both in future; candidate resets sooner with capacity", bestRem, bestReset, candidateRem, candidateReset)
 			return candidate
 		}
 		if bestReset < candidateReset && bestRem > 0 {
-			logStrategyDecision("reset_time_in_past_and_most_remaining", "both in future; best resets sooner with capacity", bestRem, bestReset, candidateRem, candidateReset)
 			return best
 		}
 	}
 
 	// Fallback to the transport with more remaining tokens.
 	if candidateRem > bestRem {
-		logStrategyDecision("reset_time_in_past_and_most_remaining", "candidate has more remaining; fallback path", bestRem, bestReset, candidateRem, candidateReset)
 		return candidate
 	}
 
-	logStrategyDecision("reset_time_in_past_and_most_remaining", "keeping current best; candidate not better", bestRem, bestReset, candidateRem, candidateReset)
 	return best
 }
 
@@ -141,14 +152,29 @@ func extractValues(resource Resource, t *Transport) (uint64, int64) {
 	return 0, 0
 }
 
+// earliestResetTime returns the earliest non-zero reset time across transports for the resource.
+// If no reset times are available, it returns the zero time value.
+func earliestResetTime(resource Resource, transports []*Transport) time.Time {
+	var earliest time.Time
+	for _, t := range transports {
+		if t == nil {
+			continue
+		}
+		if r := t.Limits.Load(resource); r != nil {
+			if r.Reset == 0 {
+				continue
+			}
+			resetTime := time.Unix(int64(r.Reset), 0)
+			if earliest.IsZero() || resetTime.Before(earliest) {
+				earliest = resetTime
+			}
+		}
+	}
+	return earliest
+}
+
 // resetIsInPastAndEarlierThanOther returns true when `reset` is non-zero, already in the past
 // relative to `now`, and either the other reset is zero or occurs later.
 func resetIsInPastAndEarlierThanOther(reset, otherReset int64) bool {
 	return reset != 0 && reset < time.Now().Unix() && (otherReset == 0 || reset < otherReset)
-}
-
-// logStrategyDecision emits debug information for strategy choices. Kept lightweight to minimize
-// overhead; callers pass already-read values to avoid extra lookups.
-func logStrategyDecision(strategy, reason string, bestRem uint64, bestReset int64, candidateRem uint64, candidateReset int64) {
-	log.Printf("[strategy=%s] %s bestRemaining=%d bestReset=%d candidateRemaining=%d candidateReset=%d", strategy, reason, bestRem, bestReset, candidateRem, candidateReset)
 }

@@ -3,6 +3,7 @@ package ghratelimit
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"testing"
@@ -241,7 +242,79 @@ func TestNewBalancingTransport(t *testing.T) {
 			t.Error("custom strategy was not used")
 		}
 	})
+
+	t.Run("returns configured error when strategy yields nil", func(t *testing.T) {
+		expected := &exhaustedWithReset{msg: "no transport available"}
+		// strategy always returns nil to simulate exhaustion
+		strategy := func(resource Resource, currentBest, candidate *Transport) *Transport {
+			return nil
+		}
+
+		m := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
+		bt := NewBalancingTransport([]*Transport{NewTransport(m)}, WithStrategy(strategy), WithErrorOnTransportsExhausted(expected))
+
+		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
+		_, err := bt.RoundTrip(req)
+		if err == nil {
+			t.Fatalf("expected error, got nil")
+		}
+		if !errors.Is(err, expected) {
+			t.Fatalf("expected error %v, got %v", expected, err)
+		}
+	})
+
+	t.Run("sets earliest reset on exhausted error when supported", func(t *testing.T) {
+		now := time.Now()
+		earliest := now.Add(10 * time.Minute)
+		latest := now.Add(20 * time.Minute)
+
+		t1 := NewTransport(nil)
+		t1.Limits.Store(nil, ResourceCore, &Rate{Remaining: 0, Reset: uint64(latest.Unix())})
+
+		t2 := NewTransport(nil)
+		t2.Limits.Store(nil, ResourceCore, &Rate{Remaining: 0, Reset: uint64(earliest.Unix())})
+
+		errWithReset := &exhaustedWithReset{msg: "exhausted"}
+		strategy := func(resource Resource, currentBest, candidate *Transport) *Transport { return nil }
+
+		bt := NewBalancingTransport([]*Transport{t1, t2}, WithStrategy(strategy), WithErrorOnTransportsExhausted(errWithReset))
+
+		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
+		_, err := bt.RoundTrip(req)
+		if err == nil {
+			t.Fatalf("expected error, got nil")
+		}
+		if !errors.Is(err, errWithReset) {
+			t.Fatalf("expected wrapped exhausted error, got %v", err)
+		}
+		if errWithReset.earliestReset.IsZero() {
+			t.Fatalf("expected earliest reset to be set")
+		}
+		if errWithReset.earliestReset.Unix() != earliest.Unix() {
+			t.Fatalf("expected earliest reset %v, got %v", earliest, errWithReset.earliestReset)
+		}
+	})
 }
+
+// exhaustedWithReset is a helper error that records the earliest reset time via SetEarliestReset.
+type exhaustedWithReset struct {
+	earliestReset time.Time
+	msg           string
+}
+
+func (e *exhaustedWithReset) As(any) bool {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (e *exhaustedWithReset) Is(error) bool {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (e *exhaustedWithReset) Error() string                { return e.msg }
+func (e *exhaustedWithReset) SetEarliestReset(t time.Time) { e.earliestReset = t }
+func (e *exhaustedWithReset) GetEarliestReset() time.Time  { return e.earliestReset }
 
 // Ensure mockRoundTripper implements http.RoundTripper
 var _ http.RoundTripper = &mockRoundTripper{}
