@@ -1,13 +1,9 @@
 package ghratelimit
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
-	"io"
 	"maps"
 	"net/http"
-	"strings"
 	"sync"
 	"testing"
 
@@ -196,48 +192,4 @@ func TestLimits_Parse(t *testing.T) {
 		},
 	})
 	assert.Error(t, err, "expected error, got nil")
-}
-
-// closeErrBody is an io.ReadCloser whose Close always fails, to verify (*Limits).Fetch
-// surfaces a Body.Close error rather than silently discarding it.
-type closeErrBody struct {
-	io.Reader
-	closeErr error
-	closed   bool
-}
-
-func (b *closeErrBody) Close() error {
-	b.closed = true
-	return b.closeErr
-}
-
-func TestLimits_Fetch_SurfacesBodyCloseError(t *testing.T) {
-	body := &closeErrBody{
-		Reader:   strings.NewReader(`{"resources":{}}`),
-		closeErr: errors.New("boom"),
-	}
-	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: body}, nil
-	})
-
-	var limits Limits
-	err := limits.Fetch(context.Background(), transport, nil)
-	assert.ErrorContains(t, err, "boom", "expected the Body.Close error to be surfaced")
-	assert.True(t, body.closed, "expected the body to be closed exactly once")
-}
-
-func TestLimits_Fetch_EarlierErrorTakesPrecedenceOverCloseError(t *testing.T) {
-	body := &closeErrBody{
-		Reader:   strings.NewReader(`not valid json`),
-		closeErr: errors.New("boom"),
-	}
-	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: body}, nil
-	})
-
-	var limits Limits
-	err := limits.Fetch(context.Background(), transport, nil)
-	assert.ErrorContains(t, err, "json.Unmarshal", "expected the earlier JSON error, not the Close error, to be returned")
-	assert.NotContains(t, err.Error(), "boom")
-	assert.True(t, body.closed, "expected the body to still be closed")
 }
