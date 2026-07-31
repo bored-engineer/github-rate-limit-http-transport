@@ -32,9 +32,6 @@ func (bt BalancingTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 
 	resource := InferResource(req)
-	if resource == "" {
-		return nil, fmt.Errorf("unknown resource for request: %q", req.URL)
-	}
 
 	now := time.Now()
 	var bestTransport *Transport

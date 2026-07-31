@@ -144,9 +144,6 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	if err != nil {
 		return fmt.Errorf("(*http.Response).Body.Read for %q failed: %w", u, err)
 	}
-	if err := resp.Body.Close(); err != nil {
-		return fmt.Errorf("(*http.Response).Body.Close for %q failed: %w", u, err)
-	}
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("(*http.Response).StatusCode(%d) != 200 for %q: %s", resp.StatusCode, u, string(body))

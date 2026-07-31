@@ -34,9 +34,10 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 		resp, err = t.Base.RoundTrip(req)
 	}
 	if resp != nil {
-		if err := t.Limits.Parse(resp); err != nil {
-			return nil, err
-		}
+		// Parse failures (e.g. malformed rate-limit headers) must not discard an otherwise
+		// valid response: doing so would drop resp.Body unclosed (leaking the connection) and
+		// hide a real response from the caller just because of a header-parsing issue.
+		_ = t.Limits.Parse(resp)
 	}
 	return
 }
