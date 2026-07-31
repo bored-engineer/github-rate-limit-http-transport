@@ -1,11 +1,15 @@
 package ghratelimit
 
 import (
+	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -99,4 +103,48 @@ func TestTransport_RoundTrip_MalformedHeadersDoNotDropResponse(t *testing.T) {
 		assert.NoError(t, resp.Body.Close())
 		assert.True(t, body.closed, "the caller must be able to close the real body")
 	}
+}
+
+func TestTransport_RoundTrip_DefaultBase(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Ratelimit-Resource", "core")
+		w.Header().Set("X-Ratelimit-Limit", "5000")
+		w.Header().Set("X-Ratelimit-Used", "1")
+		w.Header().Set("X-Ratelimit-Remaining", "4999")
+		w.Header().Set("X-Ratelimit-Reset", "1745121612")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+	assert.NoError(t, err, "http.NewRequest failed")
+
+	var transport Transport // Base is left nil, so http.DefaultTransport should be used.
+	resp, err := transport.RoundTrip(req)
+	assert.NoError(t, err, "(*Transport).RoundTrip failed")
+	if assert.NotNil(t, resp) {
+		assert.NoError(t, resp.Body.Close())
+	}
+	assert.Equal(t, &Rate{Limit: 5000, Used: 1, Remaining: 4999, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
+}
+
+func TestTransport_Poll(t *testing.T) {
+	var calls atomic.Int32
+	transport := &Transport{
+		Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader(`{"resources":{"core":{"limit":5000,"used":0,"remaining":5000,"reset":1745121612}}}`)),
+			}, nil
+		}),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 55*time.Millisecond)
+	defer cancel()
+	transport.Poll(ctx, 20*time.Millisecond, nil)
+
+	assert.GreaterOrEqual(t, calls.Load(), int32(2), "expected Poll to fetch immediately and again on subsequent ticks")
+	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
 }
