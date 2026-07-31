@@ -126,6 +126,24 @@ func TestLimits_Store(t *testing.T) {
 	}, maps.Collect(limits.Iter()))
 }
 
+func TestLimits_Reserve(t *testing.T) {
+	var limits Limits
+	// No rate stored yet for the resource, should be a no-op.
+	limits.Reserve(ResourceCore)
+	assert.Nil(t, limits.Load(ResourceCore))
+
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 0, Remaining: 2, Reset: 1745121612})
+	limits.Reserve(ResourceCore)
+	assert.Equal(t, &Rate{Limit: 5000, Used: 1, Remaining: 1, Reset: 1745121612}, limits.Load(ResourceCore))
+
+	limits.Reserve(ResourceCore)
+	assert.Equal(t, &Rate{Limit: 5000, Used: 2, Remaining: 0, Reset: 1745121612}, limits.Load(ResourceCore))
+
+	// Remaining is already 0, should be a no-op rather than underflowing.
+	limits.Reserve(ResourceCore)
+	assert.Equal(t, &Rate{Limit: 5000, Used: 2, Remaining: 0, Reset: 1745121612}, limits.Load(ResourceCore))
+}
+
 func TestLimits_Parse(t *testing.T) {
 	var limits Limits
 	err := limits.Parse(&http.Response{
