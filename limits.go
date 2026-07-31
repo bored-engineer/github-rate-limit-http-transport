@@ -123,7 +123,7 @@ func (l *Limits) Parse(resp *http.Response) error {
 
 // Fetch the latest rate limits from the GitHub API and update the Limits instance.
 // If the provided URL is nil, it defaults to DefaultURL (https://api.github.com/rate_limit).
-func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.URL) (err error) {
+func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.URL) (rerr error) {
 	if u == nil {
 		u = DefaultURL
 	}
@@ -139,8 +139,8 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 		return fmt.Errorf("(http.RoundTripper).RoundTrip for %q failed: %w", u, err)
 	}
 	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("(*http.Response).Body.Close for %q failed: %w", u, closeErr)
+		if closeErr := resp.Body.Close(); closeErr != nil && rerr == nil {
+			rerr = fmt.Errorf("(*http.Response).Body.Close for %q failed: %w", u, closeErr)
 		}
 	}()
 
