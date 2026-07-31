@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"maps"
 	"net/http"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -142,6 +143,24 @@ func TestLimits_Reserve(t *testing.T) {
 	// Remaining is already 0, should be a no-op rather than underflowing.
 	limits.Reserve(ResourceCore)
 	assert.Equal(t, &Rate{Limit: 5000, Used: 2, Remaining: 0, Reset: 1745121612}, limits.Load(ResourceCore))
+}
+
+func TestLimits_Reserve_Concurrent(t *testing.T) {
+	var limits Limits
+	const n = 1000
+	limits.Store(nil, ResourceCore, &Rate{Limit: n, Used: 0, Remaining: n, Reset: 1745121612})
+
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			limits.Reserve(ResourceCore)
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, &Rate{Limit: n, Used: n, Remaining: 0, Reset: 1745121612}, limits.Load(ResourceCore))
 }
 
 func TestLimits_Parse(t *testing.T) {
