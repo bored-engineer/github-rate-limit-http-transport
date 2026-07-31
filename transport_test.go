@@ -2,6 +2,7 @@ package ghratelimit
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -126,6 +127,109 @@ func TestTransport_RoundTrip_DefaultBase(t *testing.T) {
 		assert.NoError(t, resp.Body.Close())
 	}
 	assert.Equal(t, &Rate{Limit: 5000, Used: 1, Remaining: 4999, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
+}
+
+func TestTransport_Spoof_ExhaustedReturnsSyntheticResponse(t *testing.T) {
+	req := &http.Request{
+		URL: &url.URL{
+			Scheme: "https",
+			Host:   "api.github.com",
+			Path:   "/users/bored-engineer",
+		},
+		Method: http.MethodGet,
+	}
+
+	var baseCalled bool
+	transport := &Transport{
+		Spoof: true,
+		Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			baseCalled = true
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
+		}),
+	}
+	transport.Limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612})
+
+	resp, err := transport.RoundTrip(req)
+	assert.NoError(t, err, "(*Transport).RoundTrip failed")
+	assert.False(t, baseCalled, "the base transport must not be invoked when the request would have been rate-limited")
+	if assert.NotNil(t, resp) {
+		assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+		assert.Equal(t, "0", resp.Header.Get("X-Ratelimit-Remaining"))
+		body, readErr := io.ReadAll(resp.Body)
+		assert.NoError(t, readErr)
+		var parsed struct {
+			Message string `json:"message"`
+		}
+		assert.NoError(t, json.Unmarshal(body, &parsed), "the synthetic body must be valid JSON")
+		assert.Contains(t, parsed.Message, "API rate limit exceeded")
+	}
+	// The synthetic response must not overwrite the (already exhausted) Limits state.
+	assert.Equal(t, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
+}
+
+func TestTransport_Spoof_PassesThroughWhenNotExhausted(t *testing.T) {
+	req := &http.Request{
+		URL: &url.URL{
+			Scheme: "https",
+			Host:   "api.github.com",
+			Path:   "/users/bored-engineer",
+		},
+		Method: http.MethodGet,
+	}
+
+	var baseCalled bool
+	transport := &Transport{
+		Spoof: true,
+		Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			baseCalled = true
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"X-Ratelimit-Limit":     []string{"5000"},
+					"X-Ratelimit-Used":      []string{"1"},
+					"X-Ratelimit-Remaining": []string{"4999"},
+					"X-Ratelimit-Reset":     []string{"1745121612"},
+					"X-Ratelimit-Resource":  []string{"core"},
+				},
+				Body: http.NoBody,
+			}, nil
+		}),
+	}
+	transport.Limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 1, Remaining: 4999, Reset: 1745121612})
+
+	resp, err := transport.RoundTrip(req)
+	assert.NoError(t, err, "(*Transport).RoundTrip failed")
+	assert.True(t, baseCalled, "the base transport must be invoked when quota remains")
+	if assert.NotNil(t, resp) {
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	}
+}
+
+func TestTransport_Spoof_PassesThroughWhenUnknown(t *testing.T) {
+	req := &http.Request{
+		URL: &url.URL{
+			Scheme: "https",
+			Host:   "api.github.com",
+			Path:   "/users/bored-engineer",
+		},
+		Method: http.MethodGet,
+	}
+
+	var baseCalled bool
+	transport := &Transport{
+		Spoof: true,
+		Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			baseCalled = true
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
+		}),
+	}
+
+	resp, err := transport.RoundTrip(req)
+	assert.NoError(t, err, "(*Transport).RoundTrip failed")
+	assert.True(t, baseCalled, "the base transport must be invoked when the resource's limit is unknown")
+	if assert.NotNil(t, resp) {
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	}
 }
 
 func TestTransport_Poll(t *testing.T) {
