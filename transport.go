@@ -62,7 +62,7 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 // request is rejected because a rate limit has been exhausted, without actually sending the request.
 func spoofRateLimitResponse(req *http.Request, resource Resource, rate *Rate) *http.Response {
 	body := fmt.Sprintf(
-		`{"message":"API rate limit exceeded for resource %q.","documentation_url":"https://docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api?apiVersion=2022-11-28","status":"429"}`,
+		`{"message":"API rate limit exceeded for resource %s.","documentation_url":"https://docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api?apiVersion=2022-11-28","status":"429"}`,
 		resource,
 	)
 	header := http.Header{

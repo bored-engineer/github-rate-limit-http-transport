@@ -2,6 +2,7 @@ package ghratelimit
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -156,7 +157,11 @@ func TestTransport_Spoof_ExhaustedReturnsSyntheticResponse(t *testing.T) {
 		assert.Equal(t, "0", resp.Header.Get("X-Ratelimit-Remaining"))
 		body, readErr := io.ReadAll(resp.Body)
 		assert.NoError(t, readErr)
-		assert.Contains(t, string(body), "API rate limit exceeded")
+		var parsed struct {
+			Message string `json:"message"`
+		}
+		assert.NoError(t, json.Unmarshal(body, &parsed), "the synthetic body must be valid JSON")
+		assert.Contains(t, parsed.Message, "API rate limit exceeded")
 	}
 	// The synthetic response must not overwrite the (already exhausted) Limits state.
 	assert.Equal(t, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
