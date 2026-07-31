@@ -1,9 +1,14 @@
 package ghratelimit
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"maps"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"testing"
 
@@ -127,6 +132,26 @@ func TestLimits_Store(t *testing.T) {
 	}, maps.Collect(limits.Iter()))
 }
 
+func TestLimits_Store_Notify(t *testing.T) {
+	resp := &http.Response{StatusCode: http.StatusOK}
+	rate := &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612}
+
+	var gotResp *http.Response
+	var gotResource Resource
+	var gotRate *Rate
+	var limits Limits
+	limits.Notify = func(r *http.Response, resource Resource, rate *Rate) {
+		gotResp = r
+		gotResource = resource
+		gotRate = rate
+	}
+	limits.Store(resp, ResourceCore, rate)
+
+	assert.Same(t, resp, gotResp, "Notify should receive the *http.Response passed to Store")
+	assert.Equal(t, ResourceCore, gotResource, "Notify should receive the resource passed to Store")
+	assert.Same(t, rate, gotRate, "Notify should receive the *Rate passed to Store")
+}
+
 func TestLimits_Reserve(t *testing.T) {
 	var limits Limits
 	// No rate stored yet for the resource, should be a no-op.
@@ -192,4 +217,107 @@ func TestLimits_Parse(t *testing.T) {
 		},
 	})
 	assert.Error(t, err, "expected error, got nil")
+}
+
+func TestLimits_Fetch_Success(t *testing.T) {
+	var capturedReq *http.Request
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		capturedReq = req
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(limitsResponse)),
+		}, nil
+	})
+
+	var limits Limits
+	err := limits.Fetch(context.Background(), transport, nil)
+	assert.NoError(t, err, "(*Limits).Fetch failed")
+
+	assert.Equal(t, DefaultURL.String(), capturedReq.URL.String(), "should default to DefaultURL when u is nil")
+	assert.Equal(t, "github.com/bored-engineer/github-rate-limit-http-transport", capturedReq.Header.Get("User-Agent"))
+	assert.Equal(t, "2022-11-28", capturedReq.Header.Get("X-GitHub-Api-Version"))
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612}, limits.Load(ResourceCore))
+	assert.Equal(t, &Rate{Limit: 30, Used: 0, Remaining: 30, Reset: 1745118072}, limits.Load(ResourceSearch))
+}
+
+func TestLimits_Fetch_CustomURL(t *testing.T) {
+	custom := &url.URL{Scheme: "https", Host: "example.com", Path: "/custom/rate_limit"}
+
+	var capturedURL *url.URL
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		capturedURL = req.URL
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(`{"resources":{}}`)),
+		}, nil
+	})
+
+	var limits Limits
+	err := limits.Fetch(context.Background(), transport, custom)
+	assert.NoError(t, err, "(*Limits).Fetch failed")
+	assert.Equal(t, custom.String(), capturedURL.String(), "should use the provided URL instead of DefaultURL")
+}
+
+func TestLimits_Fetch_RoundTripError(t *testing.T) {
+	wantErr := errors.New("network down")
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, wantErr
+	})
+
+	var limits Limits
+	err := limits.Fetch(context.Background(), transport, nil)
+	assert.ErrorIs(t, err, wantErr)
+}
+
+func TestLimits_Fetch_NonOKStatus(t *testing.T) {
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("rate limited")),
+		}, nil
+	})
+
+	var limits Limits
+	err := limits.Fetch(context.Background(), transport, nil)
+	assert.ErrorContains(t, err, "403")
+	assert.ErrorContains(t, err, "rate limited")
+}
+
+func TestLimits_Fetch_MalformedJSON(t *testing.T) {
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("not json")),
+		}, nil
+	})
+
+	var limits Limits
+	err := limits.Fetch(context.Background(), transport, nil)
+	assert.ErrorContains(t, err, "json.Unmarshal")
+}
+
+// errReader always fails to Read, to simulate a body read failure.
+type errReader struct{}
+
+func (errReader) Read(p []byte) (int, error) {
+	return 0, errors.New("read failed")
+}
+
+func TestLimits_Fetch_BodyReadError(t *testing.T) {
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(errReader{}),
+		}, nil
+	})
+
+	var limits Limits
+	err := limits.Fetch(context.Background(), transport, nil)
+	assert.ErrorContains(t, err, "Body.Read")
 }

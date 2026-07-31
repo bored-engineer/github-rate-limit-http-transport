@@ -1,8 +1,12 @@
 package ghratelimit
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -115,4 +119,29 @@ func TestBalancingTransport_RoundTrip_NoTransports(t *testing.T) {
 	var bt BalancingTransport
 	_, err := bt.RoundTrip(req)
 	assert.Error(t, err, "expected an error when no transports are available")
+}
+
+func TestBalancingTransport_Poll(t *testing.T) {
+	newPolledTransport := func(calls *atomic.Int32) *Transport {
+		return &Transport{
+			Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls.Add(1)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{},
+					Body:       io.NopCloser(strings.NewReader(`{"resources":{}}`)),
+				}, nil
+			}),
+		}
+	}
+
+	var calls1, calls2 atomic.Int32
+	bt := BalancingTransport{newPolledTransport(&calls1), newPolledTransport(&calls2)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 55*time.Millisecond)
+	defer cancel()
+	bt.Poll(ctx, 20*time.Millisecond, nil)
+
+	assert.GreaterOrEqual(t, calls1.Load(), int32(1), "expected the first transport to be polled")
+	assert.GreaterOrEqual(t, calls2.Load(), int32(1), "expected the second transport to be polled")
 }
