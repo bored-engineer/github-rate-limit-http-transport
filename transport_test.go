@@ -15,7 +15,7 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-func TestTransport_Subtract(t *testing.T) {
+func TestTransport_Reserve(t *testing.T) {
 	req := &http.Request{
 		URL: &url.URL{
 			Scheme: "https",
@@ -26,7 +26,7 @@ func TestTransport_Subtract(t *testing.T) {
 	}
 
 	var remainingDuringRoundTrip uint64
-	transport := &Transport{Subtract: true}
+	transport := &Transport{Reserve: true}
 	transport.Base = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		remainingDuringRoundTrip = transport.Limits.Load(ResourceCore).Remaining
 		return &http.Response{

@@ -16,17 +16,17 @@ type Transport struct {
 	Base http.RoundTripper
 	// Limits is the most recent rate-limit information
 	Limits Limits
-	// Subtract, if true, proactively decrements the Limits.Remaining count (via Limits.Subtract) for the
+	// Reserve, if true, proactively decrements the Limits.Remaining count (via Limits.Reserve) for the
 	// inferred resource before the request is sent, rather than waiting for the response headers to be parsed.
 	// This is useful (for example, alongside BalancingTransport) to avoid routing a burst of concurrent
 	// requests to the same transport before its rate-limit headers have been updated by a response.
-	Subtract bool
+	Reserve bool
 }
 
 // RoundTrip implements http.RoundTripper
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
-	if t.Subtract {
-		t.Limits.Subtract(InferResource(req))
+	if t.Reserve {
+		t.Limits.Reserve(InferResource(req))
 	}
 	if t.Base == nil {
 		resp, err = http.DefaultTransport.RoundTrip(req)

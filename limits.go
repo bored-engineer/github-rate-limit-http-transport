@@ -49,10 +49,10 @@ func (l *Limits) Load(resource Resource) *Rate {
 	return r
 }
 
-// Subtract proactively decrements the Remaining count (and increments Used) by one for the given resource, if known.
+// Reserve proactively decrements the Remaining count (and increments Used) by one for the given resource, if known.
 // This is useful to optimistically account for an in-flight request before its response (and updated rate-limit
 // headers) has been received, to avoid a burst of concurrent requests overrunning the actual rate limit.
-func (l *Limits) Subtract(resource Resource) {
+func (l *Limits) Reserve(resource Resource) {
 	rate := l.Load(resource)
 	if rate == nil || rate.Remaining == 0 {
 		return
