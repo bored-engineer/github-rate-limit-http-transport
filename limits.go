@@ -52,17 +52,24 @@ func (l *Limits) Load(resource Resource) *Rate {
 // Reserve proactively decrements the Remaining count (and increments Used) by one for the given resource, if known.
 // This is useful to optimistically account for an in-flight request before its response (and updated rate-limit
 // headers) has been received, to avoid a burst of concurrent requests overrunning the actual rate limit.
+// A CompareAndSwap loop is used so concurrent calls don't lose updates to one another.
+// Unlike Store, this does not invoke Notify, since the estimate is superseded by the real rate limit once available.
 func (l *Limits) Reserve(resource Resource) {
-	rate := l.Load(resource)
-	if rate == nil || rate.Remaining == 0 {
-		return
+	for {
+		rate := l.Load(resource)
+		if rate == nil || rate.Remaining == 0 {
+			return
+		}
+		updated := &Rate{
+			Limit:     rate.Limit,
+			Used:      rate.Used + 1,
+			Remaining: rate.Remaining - 1,
+			Reset:     rate.Reset,
+		}
+		if l.m.CompareAndSwap(resource, rate, updated) {
+			return
+		}
 	}
-	l.Store(nil, resource, &Rate{
-		Limit:     rate.Limit,
-		Used:      rate.Used + 1,
-		Remaining: rate.Remaining - 1,
-		Reset:     rate.Reset,
-	})
 }
 
 // Iter loops over the resource types and yields each resource type and its rate limit.
