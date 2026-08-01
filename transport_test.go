@@ -232,6 +232,43 @@ func TestTransport_Spoof_PassesThroughWhenUnknown(t *testing.T) {
 	}
 }
 
+func TestTransport_Spoof_PassesThroughForRateLimitEndpoint(t *testing.T) {
+	for name, path := range map[string]string{
+		"cloud":      "/rate_limit",
+		"enterprise": "/api/v3/rate_limit",
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := &http.Request{
+				URL: &url.URL{
+					Scheme: "https",
+					Host:   "api.github.com",
+					Path:   path,
+				},
+				Method: http.MethodGet,
+			}
+
+			var baseCalled bool
+			transport := &Transport{
+				Spoof: true,
+				Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					baseCalled = true
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
+				}),
+			}
+			// The core resource is exhausted, but /rate_limit is exempt from rate-limiting
+			// and must never be spoofed, since it's the only way to learn the limit has reset.
+			transport.Limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612})
+
+			resp, err := transport.RoundTrip(req)
+			assert.NoError(t, err, "(*Transport).RoundTrip failed")
+			assert.True(t, baseCalled, "the base transport must be invoked for the /rate_limit endpoint even when exhausted")
+			if assert.NotNil(t, resp) {
+				assert.Equal(t, http.StatusOK, resp.StatusCode)
+			}
+		})
+	}
+}
+
 func TestTransport_Poll(t *testing.T) {
 	var calls atomic.Int32
 	transport := &Transport{

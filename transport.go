@@ -36,7 +36,7 @@ type Transport struct {
 // RoundTrip implements http.RoundTripper
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	resource := InferResource(req)
-	if t.Spoof {
+	if t.Spoof && !isRateLimitEndpoint(req) {
 		if rate := t.Limits.Load(resource); rate != nil && rate.Remaining == 0 {
 			return spoofRateLimitResponse(req, resource, rate), nil
 		}
@@ -56,6 +56,13 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 		_ = t.Limits.Parse(resp)
 	}
 	return
+}
+
+// isRateLimitEndpoint reports whether req targets the /rate_limit endpoint (or its enterprise
+// equivalent, /api/v3/rate_limit). Requests to this endpoint never count against any rate limit,
+// so they must never be spoofed even when the inferred resource is already exhausted.
+func isRateLimitEndpoint(req *http.Request) bool {
+	return strings.TrimPrefix(req.URL.Path, "/api/v3") == "/rate_limit"
 }
 
 // spoofRateLimitResponse constructs a synthetic *http.Response mimicking the one GitHub returns when a
