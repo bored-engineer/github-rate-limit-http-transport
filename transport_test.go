@@ -153,7 +153,7 @@ func TestTransport_Spoof_ExhaustedReturnsSyntheticResponse(t *testing.T) {
 	assert.NoError(t, err, "(*Transport).RoundTrip failed")
 	assert.False(t, baseCalled, "the base transport must not be invoked when the request would have been rate-limited")
 	if assert.NotNil(t, resp) {
-		assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
 		assert.Equal(t, "0", resp.Header.Get("X-Ratelimit-Remaining"))
 		body, readErr := io.ReadAll(resp.Body)
 		assert.NoError(t, readErr)

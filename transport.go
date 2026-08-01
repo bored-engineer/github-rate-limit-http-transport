@@ -25,7 +25,7 @@ type Transport struct {
 	// This is useful (for example, alongside BalancingTransport) to avoid routing a burst of concurrent
 	// requests to the same transport before its rate-limit headers have been updated by a response.
 	Reserve bool
-	// Spoof, if true, causes RoundTrip to return a synthetic HTTP 429 response mimicking a typical
+	// Spoof, if true, causes RoundTrip to return a synthetic HTTP 403 response mimicking a typical
 	// GitHub rate-limit response, instead of actually executing the request, whenever the Limits already
 	// indicate there is no Remaining quota for the inferred resource. This avoids sending a request that
 	// is certain to be rejected by GitHub, at the cost of not observing whatever response GitHub itself
@@ -69,7 +69,7 @@ func isRateLimitEndpoint(req *http.Request) bool {
 // request is rejected because a rate limit has been exhausted, without actually sending the request.
 func spoofRateLimitResponse(req *http.Request, resource Resource, rate *Rate) *http.Response {
 	body := fmt.Sprintf(
-		`{"message":"API rate limit exceeded for resource %s.","documentation_url":"https://docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api?apiVersion=2022-11-28","status":"429"}`,
+		`{"message":"API rate limit exceeded for resource %s.","documentation_url":"https://docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api?apiVersion=2022-11-28"}`,
 		resource,
 	)
 	header := http.Header{
@@ -84,8 +84,8 @@ func spoofRateLimitResponse(req *http.Request, resource Resource, rate *Rate) *h
 		header.Set("Retry-After", strconv.FormatFloat(retryAfter.Seconds(), 'f', 0, 64))
 	}
 	return &http.Response{
-		Status:        "429 Too Many Requests",
-		StatusCode:    http.StatusTooManyRequests,
+		Status:        "403 Forbidden",
+		StatusCode:    http.StatusForbidden,
 		Proto:         "HTTP/1.1",
 		ProtoMajor:    1,
 		ProtoMinor:    1,
