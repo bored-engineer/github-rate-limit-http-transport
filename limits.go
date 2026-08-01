@@ -36,6 +36,36 @@ func (l *Limits) Store(resp *http.Response, resource Resource, rate *Rate) {
 	}
 }
 
+// storeFresh stores rate for resource unless doing so would regress the
+// tracked state: within the same (or an earlier) reset window, Remaining
+// only ever decreases as requests are consumed, so an update reporting more
+// Remaining than what's already known, without Reset having advanced to a
+// later window, is assumed to be a stale read (e.g. from an eventually
+// consistent /rate_limit response, which can lag behind the state observed
+// by a real, concurrent request against the same resource) and is dropped.
+// Unlike Store, this does not invoke Notify when the update is dropped,
+// since nothing changed.
+func (l *Limits) storeFresh(resp *http.Response, resource Resource, rate *Rate) {
+	for {
+		existing := l.Load(resource)
+		if existing == nil {
+			if _, loaded := l.m.LoadOrStore(resource, rate); !loaded {
+				break
+			}
+			continue
+		}
+		if rate.Reset <= existing.Reset && rate.Remaining > existing.Remaining {
+			return
+		}
+		if l.m.CompareAndSwap(resource, existing, rate) {
+			break
+		}
+	}
+	if l.Notify != nil {
+		l.Notify(resp, resource, rate)
+	}
+}
+
 // Load the rate-limit for the given resource type.
 func (l *Limits) Load(resource Resource) *Rate {
 	val, ok := l.m.Load(resource)
@@ -161,7 +191,7 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	}
 
 	for resource, rate := range limits.Resources {
-		l.Store(resp, resource, &rate)
+		l.storeFresh(resp, resource, &rate)
 	}
 
 	return nil

@@ -242,6 +242,71 @@ func TestLimits_Fetch_Success(t *testing.T) {
 	assert.Equal(t, &Rate{Limit: 30, Used: 0, Remaining: 30, Reset: 1745118072}, limits.Load(ResourceSearch))
 }
 
+func TestLimits_Fetch_DropsStaleUpdate(t *testing.T) {
+	// A real, concurrent request already observed the resource as fully
+	// exhausted within the current window.
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612})
+
+	var notified bool
+	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
+
+	// Fetch (e.g. from the periodic poller) reports more Remaining for the
+	// same reset window, as if reading from a shard lagging behind the
+	// request above; this must not regress the fresher, more exhausted state.
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(`{"resources":{"core":{"limit":5000,"used":743,"remaining":4257,"reset":1745121612}}}`)),
+		}, nil
+	})
+	err := limits.Fetch(context.Background(), transport, nil)
+	assert.NoError(t, err, "(*Limits).Fetch failed")
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612}, limits.Load(ResourceCore), "the fresher, more exhausted state must be kept")
+	assert.False(t, notified, "Notify must not fire for a dropped stale update")
+}
+
+func TestLimits_Fetch_AcceptsNewerWindow(t *testing.T) {
+	// The resource was exhausted in a prior window.
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612})
+
+	// Fetch reports a later Reset (a new window), so the higher Remaining
+	// must be accepted even though it's numerically greater than before.
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(`{"resources":{"core":{"limit":5000,"used":0,"remaining":5000,"reset":1745125212}}}`)),
+		}, nil
+	})
+	err := limits.Fetch(context.Background(), transport, nil)
+	assert.NoError(t, err, "(*Limits).Fetch failed")
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745125212}, limits.Load(ResourceCore))
+}
+
+func TestLimits_Fetch_AcceptsFurtherConsumption(t *testing.T) {
+	// Normal, monotonic consumption within the same window must always be
+	// accepted regardless of the staleness guard.
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612})
+
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(`{"resources":{"core":{"limit":5000,"used":100,"remaining":4900,"reset":1745121612}}}`)),
+		}, nil
+	})
+	err := limits.Fetch(context.Background(), transport, nil)
+	assert.NoError(t, err, "(*Limits).Fetch failed")
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 100, Remaining: 4900, Reset: 1745121612}, limits.Load(ResourceCore))
+}
+
 func TestLimits_Fetch_CustomURL(t *testing.T) {
 	custom := &url.URL{Scheme: "https", Host: "example.com", Path: "/custom/rate_limit"}
 
