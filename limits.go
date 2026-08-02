@@ -22,20 +22,25 @@ var DefaultURL = &url.URL{
 
 // Limits represents the rate limits for all known resource types.
 type Limits struct {
-	// m holds the live, best-current estimate for each resource: what Load, Iter, String, Reserve,
-	// and (via Load) Spoof/BalancingTransport all observe. Store keeps it current with the latest
-	// confirmed reality; Reserve optimistically decrements it further, ahead of any response, for
-	// requests that haven't completed yet.
-	m sync.Map
-	// confirmed holds the last value actually reported by GitHub for each resource - unlike m, it
-	// is never touched by Reserve. Store's anti-regression guard compares against this instead of
-	// m, so Reserve's optimism (which can easily outpace any single real response, since it
-	// accounts for every concurrently in-flight request rather than just the one that completed)
-	// can never make a genuine, fresher confirmation look like a stale regression.
-	confirmed sync.Map
+	m sync.Map // Resource -> *entry
 	// Notify is called when a new rate limit is stored.
 	// It can be a useful hook to update metric gauges.
 	Notify func(*http.Response, Resource, *Rate)
+}
+
+// entry is the per-resource value stored in Limits.m.
+type entry struct {
+	// live is the best current estimate: what Load, Iter, String, Reserve, and (via Load)
+	// Spoof/BalancingTransport all observe. Store keeps it current with confirmed reality;
+	// Reserve optimistically decrements it further, ahead of any response, for requests that
+	// haven't completed yet.
+	live Rate
+	// confirmed is the last value actually reported by GitHub for this resource - unlike live, it
+	// is never touched by Reserve. Store's anti-regression guard compares against this instead of
+	// live, so Reserve's optimism (which can easily outpace any single real response, since it
+	// accounts for every concurrently in-flight request rather than just the one that completed)
+	// can never make a genuine, fresher confirmation look like a stale regression.
+	confirmed Rate
 }
 
 // Store the rate limit for the given resource type, unless doing so would regress the tracked
@@ -52,42 +57,31 @@ type Limits struct {
 // doesn't happen to carry an updated Reset), so the new reading is trusted unconditionally instead.
 func (l *Limits) Store(resp *http.Response, resource Resource, rate *Rate) {
 	for {
-		existing := l.loadConfirmed(resource)
-		if existing == nil {
-			if _, loaded := l.confirmed.LoadOrStore(resource, rate); !loaded {
+		old, loaded := l.m.Load(resource)
+		if !loaded {
+			ne := &entry{live: *rate, confirmed: *rate}
+			if _, loaded := l.m.LoadOrStore(resource, ne); !loaded {
 				break
 			}
 			continue
 		}
-		if rate.Reset <= existing.Reset && rate.Remaining > existing.Remaining && !existing.expired() {
+		oe := old.(*entry)
+		if rate.Reset <= oe.confirmed.Reset && rate.Remaining > oe.confirmed.Remaining && !oe.confirmed.expired() {
 			return
 		}
-		if l.confirmed.CompareAndSwap(resource, existing, rate) {
+		// rate is the new confirmed reality for resource: it supersedes live outright, including
+		// any of Reserve's speculative decrements for other requests dispatched (but not yet
+		// confirmed) since the last confirmed update. Those requests' own eventual Store calls
+		// will each move state forward again as they land; in the meantime Reserve will keep
+		// decrementing live for any further requests dispatched from here.
+		ne := &entry{live: *rate, confirmed: *rate}
+		if l.m.CompareAndSwap(resource, old, ne) {
 			break
 		}
 	}
-	// rate is now the new confirmed reality for resource: it supersedes m outright, including any
-	// of Reserve's speculative decrements for other requests dispatched (but not yet confirmed)
-	// since the last confirmed update. Those requests' own eventual Store calls will each move
-	// state forward again as they land; in the meantime Reserve will keep decrementing m for any
-	// further requests dispatched from here.
-	l.m.Store(resource, rate)
 	if l.Notify != nil {
 		l.Notify(resp, resource, rate)
 	}
-}
-
-// loadConfirmed is the confirmed-map counterpart to Load.
-func (l *Limits) loadConfirmed(resource Resource) *Rate {
-	val, ok := l.confirmed.Load(resource)
-	if !ok {
-		return nil
-	}
-	r, ok := val.(*Rate)
-	if !ok {
-		return nil
-	}
-	return r
 }
 
 // Load the rate-limit for the given resource type.
@@ -96,11 +90,12 @@ func (l *Limits) Load(resource Resource) *Rate {
 	if !ok {
 		return nil
 	}
-	r, ok := val.(*Rate)
+	e, ok := val.(*entry)
 	if !ok {
 		return nil
 	}
-	return r
+	live := e.live
+	return &live
 }
 
 // Reserve proactively decrements the Remaining count (and increments Used) by one for the given resource, if known.
@@ -110,17 +105,24 @@ func (l *Limits) Load(resource Resource) *Rate {
 // Unlike Store, this does not invoke Notify, since the estimate is superseded by the real rate limit once available.
 func (l *Limits) Reserve(resource Resource) {
 	for {
-		rate := l.Load(resource)
-		if rate == nil || rate.Remaining == 0 {
+		old, loaded := l.m.Load(resource)
+		if !loaded {
 			return
 		}
-		updated := &Rate{
-			Limit:     rate.Limit,
-			Used:      rate.Used + 1,
-			Remaining: rate.Remaining - 1,
-			Reset:     rate.Reset,
+		oe := old.(*entry)
+		if oe.live.Remaining == 0 {
+			return
 		}
-		if l.m.CompareAndSwap(resource, rate, updated) {
+		ne := &entry{
+			live: Rate{
+				Limit:     oe.live.Limit,
+				Used:      oe.live.Used + 1,
+				Remaining: oe.live.Remaining - 1,
+				Reset:     oe.live.Reset,
+			},
+			confirmed: oe.confirmed,
+		}
+		if l.m.CompareAndSwap(resource, old, ne) {
 			return
 		}
 	}
@@ -134,11 +136,12 @@ func (l *Limits) Iter() iter.Seq2[Resource, *Rate] {
 			if !ok {
 				return false
 			}
-			rate, ok := value.(*Rate)
+			e, ok := value.(*entry)
 			if !ok {
 				return false
 			}
-			return yield(resource, rate)
+			live := e.live
+			return yield(resource, &live)
 		})
 	}
 }
