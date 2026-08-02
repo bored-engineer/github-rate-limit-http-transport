@@ -22,60 +22,36 @@ var DefaultURL = &url.URL{
 
 // Limits represents the rate limits for all known resource types.
 type Limits struct {
-	m sync.Map // Resource -> *entry
+	m sync.Map // Resource -> *Rate
 	// Notify is called when a new rate limit is stored.
 	// It can be a useful hook to update metric gauges.
 	Notify func(*http.Response, Resource, *Rate)
 }
 
-// entry is the per-resource value stored in Limits.m.
-type entry struct {
-	// live is the best current estimate: what Load, Iter, String, Reserve, and (via Load)
-	// Spoof/BalancingTransport all observe. Store keeps it current with confirmed reality;
-	// Reserve optimistically decrements it further, ahead of any response, for requests that
-	// haven't completed yet.
-	live Rate
-	// confirmed is the last value actually reported by GitHub for this resource - unlike live, it
-	// is never touched by Reserve. Store's anti-regression guard compares against this instead of
-	// live, so Reserve's optimism (which can easily outpace any single real response, since it
-	// accounts for every concurrently in-flight request rather than just the one that completed)
-	// can never make a genuine, fresher confirmation look like a stale regression.
-	confirmed Rate
-}
-
-// Store the rate limit for the given resource type, unless doing so would regress the tracked
-// state: within the same (or an earlier) reset window, Remaining only ever decreases as requests
-// are consumed, so an update reporting more Remaining than what's already confirmed, without Reset
-// having advanced to a later window, is assumed to be a stale or out-of-order read (e.g. from an
-// eventually consistent /rate_limit response, or from a concurrent request whose response simply
-// arrived after a fresher one) and is dropped. Notify is not invoked when the update is dropped,
-// since nothing changed.
+// Store the rate limit for the given resource type, unless doing so would regress to an earlier
+// reset window: an update reporting an older Reset than what's already known is assumed to be a
+// stale or out-of-order read (e.g. from an eventually consistent /rate_limit response, or from a
+// concurrent request whose response simply arrived after a fresher one) and is dropped. Notify is
+// not invoked when the update is dropped, since nothing changed.
 //
-// This guard only applies while the last confirmed state's window is still current: once its
-// Reset has passed, the window has moved on in reality regardless of what Reset the new reading
-// reports (e.g. an out-of-band reset, such as GitHub clearing its counter early, whose response
-// doesn't happen to carry an updated Reset), so the new reading is trusted unconditionally instead.
+// Within the same (or a later) window, any update is accepted unconditionally - including one
+// reporting more Remaining than what's already known. This intentionally doesn't try to protect
+// against every kind of same-window staleness (Remaining can jitter non-monotonically as
+// concurrent responses complete out of order, and Reserve's own optimistic decrements are no
+// longer risk of being mistaken for one), in exchange for a much simpler implementation.
 func (l *Limits) Store(resp *http.Response, resource Resource, rate *Rate) {
 	for {
-		old, loaded := l.m.Load(resource)
-		if !loaded {
-			ne := &entry{live: *rate, confirmed: *rate}
-			if _, loaded := l.m.LoadOrStore(resource, ne); !loaded {
+		existing := l.Load(resource)
+		if existing == nil {
+			if _, loaded := l.m.LoadOrStore(resource, rate); !loaded {
 				break
 			}
 			continue
 		}
-		oe := old.(*entry)
-		if rate.Reset <= oe.confirmed.Reset && rate.Remaining > oe.confirmed.Remaining && !oe.confirmed.expired() {
+		if rate.Reset < existing.Reset {
 			return
 		}
-		// rate is the new confirmed reality for resource: it supersedes live outright, including
-		// any of Reserve's speculative decrements for other requests dispatched (but not yet
-		// confirmed) since the last confirmed update. Those requests' own eventual Store calls
-		// will each move state forward again as they land; in the meantime Reserve will keep
-		// decrementing live for any further requests dispatched from here.
-		ne := &entry{live: *rate, confirmed: *rate}
-		if l.m.CompareAndSwap(resource, old, ne) {
+		if l.m.CompareAndSwap(resource, existing, rate) {
 			break
 		}
 	}
@@ -90,12 +66,11 @@ func (l *Limits) Load(resource Resource) *Rate {
 	if !ok {
 		return nil
 	}
-	e, ok := val.(*entry)
+	r, ok := val.(*Rate)
 	if !ok {
 		return nil
 	}
-	live := e.live
-	return &live
+	return r
 }
 
 // Reserve proactively decrements the Remaining count (and increments Used) by one for the given resource, if known.
@@ -105,24 +80,17 @@ func (l *Limits) Load(resource Resource) *Rate {
 // Unlike Store, this does not invoke Notify, since the estimate is superseded by the real rate limit once available.
 func (l *Limits) Reserve(resource Resource) {
 	for {
-		old, loaded := l.m.Load(resource)
-		if !loaded {
+		rate := l.Load(resource)
+		if rate == nil || rate.Remaining == 0 {
 			return
 		}
-		oe := old.(*entry)
-		if oe.live.Remaining == 0 {
-			return
+		updated := &Rate{
+			Limit:     rate.Limit,
+			Used:      rate.Used + 1,
+			Remaining: rate.Remaining - 1,
+			Reset:     rate.Reset,
 		}
-		ne := &entry{
-			live: Rate{
-				Limit:     oe.live.Limit,
-				Used:      oe.live.Used + 1,
-				Remaining: oe.live.Remaining - 1,
-				Reset:     oe.live.Reset,
-			},
-			confirmed: oe.confirmed,
-		}
-		if l.m.CompareAndSwap(resource, old, ne) {
+		if l.m.CompareAndSwap(resource, rate, updated) {
 			return
 		}
 	}
@@ -136,12 +104,11 @@ func (l *Limits) Iter() iter.Seq2[Resource, *Rate] {
 			if !ok {
 				return false
 			}
-			e, ok := value.(*entry)
+			rate, ok := value.(*Rate)
 			if !ok {
 				return false
 			}
-			live := e.live
-			return yield(resource, &live)
+			return yield(resource, rate)
 		})
 	}
 }
