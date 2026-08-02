@@ -22,7 +22,17 @@ var DefaultURL = &url.URL{
 
 // Limits represents the rate limits for all known resource types.
 type Limits struct {
+	// m holds the live, best-current estimate for each resource: what Load, Iter, String, Reserve,
+	// and (via Load) Spoof/BalancingTransport all observe. Store keeps it current with the latest
+	// confirmed reality; Reserve optimistically decrements it further, ahead of any response, for
+	// requests that haven't completed yet.
 	m sync.Map
+	// confirmed holds the last value actually reported by GitHub for each resource - unlike m, it
+	// is never touched by Reserve. Store's anti-regression guard compares against this instead of
+	// m, so Reserve's optimism (which can easily outpace any single real response, since it
+	// accounts for every concurrently in-flight request rather than just the one that completed)
+	// can never make a genuine, fresher confirmation look like a stale regression.
+	confirmed sync.Map
 	// Notify is called when a new rate limit is stored.
 	// It can be a useful hook to update metric gauges.
 	Notify func(*http.Response, Resource, *Rate)
@@ -30,21 +40,21 @@ type Limits struct {
 
 // Store the rate limit for the given resource type, unless doing so would regress the tracked
 // state: within the same (or an earlier) reset window, Remaining only ever decreases as requests
-// are consumed, so an update reporting more Remaining than what's already known, without Reset
+// are consumed, so an update reporting more Remaining than what's already confirmed, without Reset
 // having advanced to a later window, is assumed to be a stale or out-of-order read (e.g. from an
 // eventually consistent /rate_limit response, or from a concurrent request whose response simply
 // arrived after a fresher one) and is dropped. Notify is not invoked when the update is dropped,
 // since nothing changed.
 //
-// This guard only applies while the existing state's window is still current: once its Reset has
-// passed, the window has moved on in reality regardless of what Reset the new reading reports
-// (e.g. an out-of-band reset, such as GitHub clearing its counter early, whose response doesn't
-// happen to carry an updated Reset), so the new reading is trusted unconditionally instead.
+// This guard only applies while the last confirmed state's window is still current: once its
+// Reset has passed, the window has moved on in reality regardless of what Reset the new reading
+// reports (e.g. an out-of-band reset, such as GitHub clearing its counter early, whose response
+// doesn't happen to carry an updated Reset), so the new reading is trusted unconditionally instead.
 func (l *Limits) Store(resp *http.Response, resource Resource, rate *Rate) {
 	for {
-		existing := l.Load(resource)
+		existing := l.loadConfirmed(resource)
 		if existing == nil {
-			if _, loaded := l.m.LoadOrStore(resource, rate); !loaded {
+			if _, loaded := l.confirmed.LoadOrStore(resource, rate); !loaded {
 				break
 			}
 			continue
@@ -52,13 +62,32 @@ func (l *Limits) Store(resp *http.Response, resource Resource, rate *Rate) {
 		if rate.Reset <= existing.Reset && rate.Remaining > existing.Remaining && !existing.expired() {
 			return
 		}
-		if l.m.CompareAndSwap(resource, existing, rate) {
+		if l.confirmed.CompareAndSwap(resource, existing, rate) {
 			break
 		}
 	}
+	// rate is now the new confirmed reality for resource: it supersedes m outright, including any
+	// of Reserve's speculative decrements for other requests dispatched (but not yet confirmed)
+	// since the last confirmed update. Those requests' own eventual Store calls will each move
+	// state forward again as they land; in the meantime Reserve will keep decrementing m for any
+	// further requests dispatched from here.
+	l.m.Store(resource, rate)
 	if l.Notify != nil {
 		l.Notify(resp, resource, rate)
 	}
+}
+
+// loadConfirmed is the confirmed-map counterpart to Load.
+func (l *Limits) loadConfirmed(resource Resource) *Rate {
+	val, ok := l.confirmed.Load(resource)
+	if !ok {
+		return nil
+	}
+	r, ok := val.(*Rate)
+	if !ok {
+		return nil
+	}
+	return r
 }
 
 // Load the rate-limit for the given resource type.

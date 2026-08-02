@@ -193,6 +193,31 @@ func TestLimits_Store_AcceptsCorrectionAfterExpiry(t *testing.T) {
 	assert.True(t, notified, "Notify must fire for an accepted update")
 }
 
+func TestLimits_Store_NotBlockedByReserve(t *testing.T) {
+	// Simulates a burst of concurrent requests: Reserve optimistically pre-decrements for every
+	// one of them before any response comes back, so by the time the first real response lands,
+	// Reserve has already outpaced it (it accounts for all the other still in-flight requests too,
+	// not just the one that completed).
+	reset := uint64(time.Now().Add(time.Hour).Unix())
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 100, Used: 0, Remaining: 100, Reset: reset})
+	for range 50 {
+		limits.Reserve(ResourceCore)
+	}
+	assert.Equal(t, &Rate{Limit: 100, Used: 50, Remaining: 50, Reset: reset}, limits.Load(ResourceCore))
+
+	var notified bool
+	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
+
+	// The first of those 50 requests' real response now lands, reporting the true state as of
+	// when GitHub processed it - it must not be mistaken for a stale regression just because
+	// Reserve's speculative estimate for the other 49 still-in-flight requests is further ahead.
+	limits.Store(nil, ResourceCore, &Rate{Limit: 100, Used: 1, Remaining: 99, Reset: reset})
+
+	assert.Equal(t, &Rate{Limit: 100, Used: 1, Remaining: 99, Reset: reset}, limits.Load(ResourceCore), "a real confirmed response must supersede Reserve's speculative estimate")
+	assert.True(t, notified, "Notify must fire for a genuinely fresher confirmed response")
+}
+
 func TestLimits_Store_AcceptsNewerWindow(t *testing.T) {
 	var limits Limits
 	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612})
