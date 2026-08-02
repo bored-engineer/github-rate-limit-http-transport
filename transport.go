@@ -36,12 +36,13 @@ type Transport struct {
 // RoundTrip implements http.RoundTripper
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	resource := InferResource(req)
-	if t.Spoof && !isRateLimitEndpoint(req) {
+	rateLimitEndpoint := isRateLimitEndpoint(req)
+	if t.Spoof && !rateLimitEndpoint {
 		if rate := t.Limits.Load(resource); rate != nil && rate.Remaining == 0 {
 			return spoofRateLimitResponse(req, resource, rate), nil
 		}
 	}
-	if t.Reserve {
+	if t.Reserve && !rateLimitEndpoint {
 		t.Limits.Reserve(resource)
 	}
 	if t.Base == nil {
@@ -49,7 +50,13 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	} else {
 		resp, err = t.Base.RoundTrip(req)
 	}
-	if resp != nil {
+	// The /rate_limit endpoint's own response carries the same X-Ratelimit-* headers describing
+	// the core resource, but it must not be parsed here: (*Limits).Fetch already stores this
+	// response's full body (every resource, not just core) through the anti-regression-guarded
+	// storeFresh. Parsing it again here too would go through the unguarded Store instead, racing
+	// concurrent requests' fresher updates and silently re-introducing the regression storeFresh
+	// exists to prevent, plus firing a redundant Notify on every poll tick.
+	if resp != nil && !rateLimitEndpoint {
 		// Parse failures (e.g. malformed rate-limit headers) must not discard an otherwise
 		// valid response: doing so would drop resp.Body unclosed (leaking the connection) and
 		// hide a real response from the caller just because of a header-parsing issue.
@@ -60,7 +67,8 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 
 // isRateLimitEndpoint reports whether req targets the /rate_limit endpoint (or its enterprise
 // equivalent, /api/v3/rate_limit). Requests to this endpoint never count against any rate limit,
-// so they must never be spoofed even when the inferred resource is already exhausted.
+// so they must never be spoofed, reserved against, or have their response parsed as a normal
+// rate-limited response, even when the inferred resource is already exhausted.
 func isRateLimitEndpoint(req *http.Request) bool {
 	return strings.TrimPrefix(req.URL.Path, "/api/v3") == "/rate_limit"
 }

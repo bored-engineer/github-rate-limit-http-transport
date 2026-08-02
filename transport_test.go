@@ -269,6 +269,119 @@ func TestTransport_Spoof_PassesThroughForRateLimitEndpoint(t *testing.T) {
 	}
 }
 
+func TestTransport_Reserve_ExemptForRateLimitEndpoint(t *testing.T) {
+	for name, path := range map[string]string{
+		"cloud":      "/rate_limit",
+		"enterprise": "/api/v3/rate_limit",
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := &http.Request{
+				URL: &url.URL{
+					Scheme: "https",
+					Host:   "api.github.com",
+					Path:   path,
+				},
+				Method: http.MethodGet,
+			}
+
+			var remainingDuringRoundTrip uint64
+			transport := &Transport{Reserve: true}
+			transport.Base = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				remainingDuringRoundTrip = transport.Limits.Load(ResourceCore).Remaining
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
+			})
+			transport.Limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612})
+
+			_, err := transport.RoundTrip(req)
+			assert.NoError(t, err, "(*Transport).RoundTrip failed")
+
+			// /rate_limit never counts against any resource, so Reserve must not touch it.
+			assert.Equal(t, uint64(5000), remainingDuringRoundTrip)
+			assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
+		})
+	}
+}
+
+func TestTransport_RoundTrip_DoesNotParseRateLimitEndpointResponse(t *testing.T) {
+	for name, path := range map[string]string{
+		"cloud":      "/rate_limit",
+		"enterprise": "/api/v3/rate_limit",
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := &http.Request{
+				URL: &url.URL{
+					Scheme: "https",
+					Host:   "api.github.com",
+					Path:   path,
+				},
+				Method: http.MethodGet,
+			}
+
+			var notifyCalls atomic.Int32
+			transport := &Transport{
+				Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					// GitHub's real /rate_limit response carries the same X-Ratelimit-* headers
+					// describing the core resource that any other endpoint's response would.
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header: http.Header{
+							"X-Ratelimit-Limit":     []string{"5000"},
+							"X-Ratelimit-Used":      []string{"9999"},
+							"X-Ratelimit-Remaining": []string{"1"},
+							"X-Ratelimit-Reset":     []string{"1745121612"},
+							"X-Ratelimit-Resource":  []string{"core"},
+						},
+						Body: http.NoBody,
+					}, nil
+				}),
+			}
+			transport.Limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 1, Remaining: 4999, Reset: 1745121612})
+			transport.Limits.Notify = func(*http.Response, Resource, *Rate) { notifyCalls.Add(1) }
+
+			_, err := transport.RoundTrip(req)
+			assert.NoError(t, err, "(*Transport).RoundTrip failed")
+
+			// The /rate_limit response's own headers must not be parsed into Limits: that's
+			// (*Limits).Fetch's job (via its anti-regression-guarded storeFresh, using the full
+			// JSON body), not RoundTrip's. Parsing it here too would race Fetch's own write and
+			// fire a redundant Notify.
+			assert.Zero(t, notifyCalls.Load(), "RoundTrip must not Notify for a /rate_limit response")
+			assert.Equal(t, &Rate{Limit: 5000, Used: 1, Remaining: 4999, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
+		})
+	}
+}
+
+func TestTransport_Poll_DoesNotDoubleNotify(t *testing.T) {
+	transport := &Transport{
+		Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			// Mirrors a real GitHub /rate_limit response: X-Ratelimit-* headers for core
+			// alongside the full per-resource JSON body.
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"X-Ratelimit-Limit":     []string{"5000"},
+					"X-Ratelimit-Used":      []string{"0"},
+					"X-Ratelimit-Remaining": []string{"5000"},
+					"X-Ratelimit-Reset":     []string{"1745121612"},
+					"X-Ratelimit-Resource":  []string{"core"},
+				},
+				Body: io.NopCloser(strings.NewReader(`{"resources":{"core":{"limit":5000,"used":0,"remaining":5000,"reset":1745121612}}}`)),
+			}, nil
+		}),
+	}
+	var notifyCalls atomic.Int32
+	transport.Limits.Notify = func(*http.Response, Resource, *Rate) { notifyCalls.Add(1) }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+	defer cancel()
+	transport.Poll(ctx, time.Hour, nil)
+
+	// Exactly one Notify (from Fetch's storeFresh), not two (the second being the bug: RoundTrip
+	// separately parsing the same response's headers through the unguarded Store).
+	assert.Equal(t, int32(1), notifyCalls.Load())
+	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
+}
+
 func TestTransport_Poll(t *testing.T) {
 	var calls atomic.Int32
 	transport := &Transport{
