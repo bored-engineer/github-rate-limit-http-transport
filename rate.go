@@ -25,13 +25,13 @@ func (r *Rate) String() string {
 }
 
 // expired reports whether the current wall-clock time is at or past r.Reset, meaning the window
-// r describes has already ended. A cached decision based on r (e.g. Spoof treating Remaining as
-// exhausted, or Store treating a higher Remaining as a stale regression) can no longer be trusted
-// once this is true: the real window has moved on even if a subsequent read still reports Reset
-// unchanged (e.g. an out-of-band reset, such as GitHub clearing its counter early, that isn't
-// reflected in every field of the response that observes it).
+// r describes has already ended. A cached decision based on r (e.g. Spoof treating Remaining == 0
+// as exhausted) can no longer be trusted once this is true: the real window has moved on even if
+// a subsequent read still reports Reset unchanged (e.g. an out-of-band reset, such as GitHub
+// clearing its counter early, that isn't reflected in every field of the response that observes
+// it).
 func (r *Rate) expired() bool {
-	return !time.Now().Before(time.Unix(int64(r.Reset), 0))
+	return uint64(time.Now().Unix()) >= r.Reset
 }
 
 // Parse extracts the rate limit information from the HTTP response headers.
