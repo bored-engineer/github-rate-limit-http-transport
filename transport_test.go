@@ -139,6 +139,7 @@ func TestTransport_Spoof_ExhaustedReturnsSyntheticResponse(t *testing.T) {
 		Method: http.MethodGet,
 	}
 
+	reset := uint64(time.Now().Add(time.Hour).Unix())
 	var baseCalled bool
 	transport := &Transport{
 		Spoof: true,
@@ -147,7 +148,7 @@ func TestTransport_Spoof_ExhaustedReturnsSyntheticResponse(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
 		}),
 	}
-	transport.Limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612})
+	transport.Limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: reset})
 
 	resp, err := transport.RoundTrip(req)
 	assert.NoError(t, err, "(*Transport).RoundTrip failed")
@@ -164,7 +165,38 @@ func TestTransport_Spoof_ExhaustedReturnsSyntheticResponse(t *testing.T) {
 		assert.Contains(t, parsed.Message, "API rate limit exceeded")
 	}
 	// The synthetic response must not overwrite the (already exhausted) Limits state.
-	assert.Equal(t, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
+	assert.Equal(t, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: reset}, transport.Limits.Load(ResourceCore))
+}
+
+func TestTransport_Spoof_PassesThroughWhenExpired(t *testing.T) {
+	req := &http.Request{
+		URL: &url.URL{
+			Scheme: "https",
+			Host:   "api.github.com",
+			Path:   "/users/bored-engineer",
+		},
+		Method: http.MethodGet,
+	}
+
+	// The tracked window's Reset has already passed (e.g. Poll simply hasn't ticked since the
+	// real reset happened, whether on schedule or early), so a cached Remaining == 0 can no
+	// longer be trusted: the real request must be allowed through instead of being spoofed.
+	var baseCalled bool
+	transport := &Transport{
+		Spoof: true,
+		Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			baseCalled = true
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
+		}),
+	}
+	transport.Limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: uint64(time.Now().Add(-time.Hour).Unix())})
+
+	resp, err := transport.RoundTrip(req)
+	assert.NoError(t, err, "(*Transport).RoundTrip failed")
+	assert.True(t, baseCalled, "the base transport must be invoked once the cached window has expired")
+	if assert.NotNil(t, resp) {
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	}
 }
 
 func TestTransport_Spoof_PassesThroughWhenNotExhausted(t *testing.T) {
@@ -255,9 +287,10 @@ func TestTransport_Spoof_PassesThroughForRateLimitEndpoint(t *testing.T) {
 					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
 				}),
 			}
-			// The core resource is exhausted, but /rate_limit is exempt from rate-limiting
-			// and must never be spoofed, since it's the only way to learn the limit has reset.
-			transport.Limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612})
+			// The core resource is exhausted within a window that's still current, but /rate_limit
+			// is exempt from rate-limiting and must never be spoofed, since it's the only way to
+			// learn the limit has reset.
+			transport.Limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: uint64(time.Now().Add(time.Hour).Unix())})
 
 			resp, err := transport.RoundTrip(req)
 			assert.NoError(t, err, "(*Transport).RoundTrip failed")
@@ -342,9 +375,9 @@ func TestTransport_RoundTrip_DoesNotParseRateLimitEndpointResponse(t *testing.T)
 			assert.NoError(t, err, "(*Transport).RoundTrip failed")
 
 			// The /rate_limit response's own headers must not be parsed into Limits: that's
-			// (*Limits).Fetch's job (via its anti-regression-guarded storeFresh, using the full
-			// JSON body), not RoundTrip's. Parsing it here too would race Fetch's own write and
-			// fire a redundant Notify.
+			// (*Limits).Fetch's job (via Store, using the full JSON body), not RoundTrip's.
+			// Parsing it here too would redundantly re-store the same entry and fire a
+			// spurious extra Notify.
 			assert.Zero(t, notifyCalls.Load(), "RoundTrip must not Notify for a /rate_limit response")
 			assert.Equal(t, &Rate{Limit: 5000, Used: 1, Remaining: 4999, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
 		})
@@ -376,8 +409,8 @@ func TestTransport_Poll_DoesNotDoubleNotify(t *testing.T) {
 	defer cancel()
 	transport.Poll(ctx, time.Hour, nil)
 
-	// Exactly one Notify (from Fetch's storeFresh), not two (the second being the bug: RoundTrip
-	// separately parsing the same response's headers through the unguarded Store).
+	// Exactly one Notify (from Fetch's own Store call), not two (the second being the bug:
+	// RoundTrip separately re-parsing the same response's headers).
 	assert.Equal(t, int32(1), notifyCalls.Load())
 	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
 }

@@ -38,7 +38,11 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	resource := InferResource(req)
 	rateLimitEndpoint := isRateLimitEndpoint(req)
 	if t.Spoof && !rateLimitEndpoint {
-		if rate := t.Limits.Load(resource); rate != nil && rate.Remaining == 0 {
+		// A cached Remaining == 0 is only trustworthy while its window is still current: once
+		// Reset has passed, the window has moved on regardless of whether anything has refreshed
+		// Limits yet (e.g. Poll hasn't ticked since), so it's no longer safe to assume the real
+		// request would be rejected.
+		if rate := t.Limits.Load(resource); rate != nil && rate.Remaining == 0 && !rate.expired() {
 			return spoofRateLimitResponse(req, resource, rate), nil
 		}
 	}
@@ -52,10 +56,9 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	}
 	// The /rate_limit endpoint's own response carries the same X-Ratelimit-* headers describing
 	// the core resource, but it must not be parsed here: (*Limits).Fetch already stores this
-	// response's full body (every resource, not just core) through the anti-regression-guarded
-	// storeFresh. Parsing it again here too would go through the unguarded Store instead, racing
-	// concurrent requests' fresher updates and silently re-introducing the regression storeFresh
-	// exists to prevent, plus firing a redundant Notify on every poll tick.
+	// response's full body (every resource, not just core, unlike these headers) via Store.
+	// Parsing it again here too would just redundantly re-store the same "core" entry a second
+	// time from the same response, firing a spurious extra Notify on every poll tick.
 	if resp != nil && !rateLimitEndpoint {
 		// Parse failures (e.g. malformed rate-limit headers) must not discard an otherwise
 		// valid response: doing so would drop resp.Body unclosed (leaking the connection) and

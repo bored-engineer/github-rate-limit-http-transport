@@ -22,30 +22,24 @@ var DefaultURL = &url.URL{
 
 // Limits represents the rate limits for all known resource types.
 type Limits struct {
-	m sync.Map
+	m sync.Map // Resource -> *Rate
 	// Notify is called when a new rate limit is stored.
 	// It can be a useful hook to update metric gauges.
 	Notify func(*http.Response, Resource, *Rate)
 }
 
-// Store the rate limit for the given resource type.
+// Store the rate limit for the given resource type, unless doing so would regress to an earlier
+// reset window: an update reporting an older Reset than what's already known is assumed to be a
+// stale or out-of-order read (e.g. from an eventually consistent /rate_limit response, or from a
+// concurrent request whose response simply arrived after a fresher one) and is dropped. Notify is
+// not invoked when the update is dropped, since nothing changed.
+//
+// Within the same (or a later) window, any update is accepted unconditionally - including one
+// reporting more Remaining than what's already known. This intentionally doesn't try to protect
+// against every kind of same-window staleness (Remaining can jitter non-monotonically as
+// concurrent responses complete out of order, and Reserve's own optimistic decrements are no
+// longer risk of being mistaken for one), in exchange for a much simpler implementation.
 func (l *Limits) Store(resp *http.Response, resource Resource, rate *Rate) {
-	l.m.Store(resource, rate)
-	if l.Notify != nil {
-		l.Notify(resp, resource, rate)
-	}
-}
-
-// storeFresh stores rate for resource unless doing so would regress the
-// tracked state: within the same (or an earlier) reset window, Remaining
-// only ever decreases as requests are consumed, so an update reporting more
-// Remaining than what's already known, without Reset having advanced to a
-// later window, is assumed to be a stale read (e.g. from an eventually
-// consistent /rate_limit response, which can lag behind the state observed
-// by a real, concurrent request against the same resource) and is dropped.
-// Unlike Store, this does not invoke Notify when the update is dropped,
-// since nothing changed.
-func (l *Limits) storeFresh(resp *http.Response, resource Resource, rate *Rate) {
 	for {
 		existing := l.Load(resource)
 		if existing == nil {
@@ -54,7 +48,7 @@ func (l *Limits) storeFresh(resp *http.Response, resource Resource, rate *Rate) 
 			}
 			continue
 		}
-		if rate.Reset <= existing.Reset && rate.Remaining > existing.Remaining {
+		if rate.Reset < existing.Reset {
 			return
 		}
 		if l.m.CompareAndSwap(resource, existing, rate) {
@@ -191,7 +185,7 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	}
 
 	for resource, rate := range limits.Resources {
-		l.storeFresh(resp, resource, &rate)
+		l.Store(resp, resource, &rate)
 	}
 
 	return nil

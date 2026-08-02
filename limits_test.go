@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -152,6 +154,105 @@ func TestLimits_Store_Notify(t *testing.T) {
 	assert.Same(t, rate, gotRate, "Notify should receive the *Rate passed to Store")
 }
 
+func TestLimits_Store_AcceptsRegressionWithinSameWindow(t *testing.T) {
+	// Store intentionally does not guard against same-window staleness: a response reporting less
+	// consumption than one already seen (e.g. two concurrent requests whose responses completed
+	// out of dispatch order) is accepted like any other update, in exchange for not needing to
+	// compare Remaining at all. See TestLimits_Store_DropsOlderWindow for the one case it does
+	// still reject.
+	reset := uint64(time.Now().Add(time.Hour).Unix())
+
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 100, Remaining: 4900, Reset: reset})
+
+	var notified bool
+	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
+
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 90, Remaining: 4910, Reset: reset})
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 90, Remaining: 4910, Reset: reset}, limits.Load(ResourceCore))
+	assert.True(t, notified, "Notify must fire for an accepted update")
+}
+
+func TestLimits_Store_DropsOlderWindow(t *testing.T) {
+	reset := uint64(time.Now().Add(time.Hour).Unix())
+
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: reset})
+
+	var notified bool
+	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
+
+	// An update reporting an older Reset than what's already known - e.g. a stale/out-of-order
+	// read - must still be dropped.
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 4000, Remaining: 1000, Reset: reset - 3600})
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: reset}, limits.Load(ResourceCore), "an older window must be kept out")
+	assert.False(t, notified, "Notify must not fire for a dropped update")
+}
+
+func TestLimits_Store_NotBlockedByReserve(t *testing.T) {
+	// Simulates a burst of concurrent requests: Reserve optimistically pre-decrements for every
+	// one of them before any response comes back. Since Store's only guard is against an older
+	// Reset, Reserve's speculation (which never changes Reset) can never block a real response
+	// from taking effect, regardless of how far Reserve has run ahead of it.
+	reset := uint64(time.Now().Add(time.Hour).Unix())
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 100, Used: 0, Remaining: 100, Reset: reset})
+	for range 50 {
+		limits.Reserve(ResourceCore)
+	}
+	assert.Equal(t, &Rate{Limit: 100, Used: 50, Remaining: 50, Reset: reset}, limits.Load(ResourceCore))
+
+	var notified bool
+	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
+
+	// The first of those 50 requests' real response now lands, reporting the true state as of
+	// when GitHub processed it.
+	limits.Store(nil, ResourceCore, &Rate{Limit: 100, Used: 1, Remaining: 99, Reset: reset})
+
+	assert.Equal(t, &Rate{Limit: 100, Used: 1, Remaining: 99, Reset: reset}, limits.Load(ResourceCore), "a real confirmed response must take effect regardless of Reserve's speculative estimate")
+	assert.True(t, notified, "Notify must fire for the accepted update")
+}
+
+func TestLimits_Store_AcceptsNewerWindow(t *testing.T) {
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612})
+
+	// A later Reset (a new window) must be accepted even though Remaining is numerically greater
+	// than the prior window's exhausted state.
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745125212})
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745125212}, limits.Load(ResourceCore))
+}
+
+func TestLimits_Store_Concurrent(t *testing.T) {
+	// Concurrent Store calls against the same resource must not race or panic; which one's data
+	// ultimately wins isn't guaranteed (see TestLimits_Store_AcceptsRegressionWithinSameWindow),
+	// but the final state must be one of the values actually written, not a torn/corrupted one.
+	const n = 200
+	reset := uint64(time.Now().Add(time.Hour).Unix())
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: n, Used: 0, Remaining: n, Reset: reset})
+
+	var wg sync.WaitGroup
+	for used := uint64(1); used <= n; used++ {
+		wg.Add(1)
+		go func(used uint64) {
+			defer wg.Done()
+			limits.Store(nil, ResourceCore, &Rate{Limit: n, Used: used, Remaining: n - used, Reset: reset})
+		}(used)
+	}
+	wg.Wait()
+
+	got := limits.Load(ResourceCore)
+	if assert.NotNil(t, got) {
+		assert.LessOrEqual(t, got.Used, uint64(n))
+		assert.Equal(t, uint64(n), got.Used+got.Remaining)
+		assert.Equal(t, reset, got.Reset)
+	}
+}
+
 func TestLimits_Reserve(t *testing.T) {
 	var limits Limits
 	// No rate stored yet for the resource, should be a no-op.
@@ -242,30 +343,54 @@ func TestLimits_Fetch_Success(t *testing.T) {
 	assert.Equal(t, &Rate{Limit: 30, Used: 0, Remaining: 30, Reset: 1745118072}, limits.Load(ResourceSearch))
 }
 
-func TestLimits_Fetch_DropsStaleUpdate(t *testing.T) {
-	// A real, concurrent request already observed the resource as fully
-	// exhausted within the current window.
+func TestLimits_Fetch_AcceptsSameWindowUpdate(t *testing.T) {
+	// A real, concurrent request already observed the resource as fully exhausted within the
+	// current window.
+	reset := uint64(time.Now().Add(time.Hour).Unix())
 	var limits Limits
-	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612})
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: reset})
 
 	var notified bool
 	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
 
-	// Fetch (e.g. from the periodic poller) reports more Remaining for the
-	// same reset window, as if reading from a shard lagging behind the
-	// request above; this must not regress the fresher, more exhausted state.
+	// Fetch (e.g. from the periodic poller) reports more Remaining for the same reset window, as
+	// if reading from a shard lagging behind the request above. Store doesn't guard against this
+	// kind of same-window staleness, so it's accepted like any other update.
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{},
-			Body:       io.NopCloser(strings.NewReader(`{"resources":{"core":{"limit":5000,"used":743,"remaining":4257,"reset":1745121612}}}`)),
+			Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"resources":{"core":{"limit":5000,"used":743,"remaining":4257,"reset":%d}}}`, reset))),
 		}, nil
 	})
 	err := limits.Fetch(context.Background(), transport, nil)
 	assert.NoError(t, err, "(*Limits).Fetch failed")
 
-	assert.Equal(t, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612}, limits.Load(ResourceCore), "the fresher, more exhausted state must be kept")
-	assert.False(t, notified, "Notify must not fire for a dropped stale update")
+	assert.Equal(t, &Rate{Limit: 5000, Used: 743, Remaining: 4257, Reset: reset}, limits.Load(ResourceCore))
+	assert.True(t, notified, "Notify must fire for an accepted update")
+}
+
+func TestLimits_Fetch_DropsOlderWindow(t *testing.T) {
+	reset := uint64(time.Now().Add(time.Hour).Unix())
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: reset})
+
+	var notified bool
+	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
+
+	// Fetch reports an older Reset than what's already known - a stale read - and must be dropped.
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"resources":{"core":{"limit":5000,"used":4000,"remaining":1000,"reset":%d}}}`, reset-3600))),
+		}, nil
+	})
+	err := limits.Fetch(context.Background(), transport, nil)
+	assert.NoError(t, err, "(*Limits).Fetch failed")
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: reset}, limits.Load(ResourceCore), "an older window must be kept out")
+	assert.False(t, notified, "Notify must not fire for a dropped update")
 }
 
 func TestLimits_Fetch_AcceptsNewerWindow(t *testing.T) {
