@@ -38,7 +38,11 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	resource := InferResource(req)
 	rateLimitEndpoint := isRateLimitEndpoint(req)
 	if t.Spoof && !rateLimitEndpoint {
-		if rate := t.Limits.Load(resource); rate != nil && rate.Remaining == 0 {
+		// A cached Remaining == 0 is only trustworthy while its window is still current: once
+		// Reset has passed, the window has moved on regardless of whether anything has refreshed
+		// Limits yet (e.g. Poll hasn't ticked since), so it's no longer safe to assume the real
+		// request would be rejected.
+		if rate := t.Limits.Load(resource); rate != nil && rate.Remaining == 0 && !rate.expired() {
 			return spoofRateLimitResponse(req, resource, rate), nil
 		}
 	}

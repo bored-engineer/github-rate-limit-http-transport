@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -153,8 +155,12 @@ func TestLimits_Store_Notify(t *testing.T) {
 }
 
 func TestLimits_Store_DropsRegression(t *testing.T) {
+	// The window must still be current (Reset in the future) for the anti-regression guard to
+	// apply at all; see TestLimits_Store_AcceptsCorrectionAfterExpiry for the opposite case.
+	reset := uint64(time.Now().Add(time.Hour).Unix())
+
 	var limits Limits
-	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 100, Remaining: 4900, Reset: 1745121612})
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 100, Remaining: 4900, Reset: reset})
 
 	var notified bool
 	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
@@ -162,10 +168,29 @@ func TestLimits_Store_DropsRegression(t *testing.T) {
 	// A response reporting less consumption within the same window arrives after a fresher, more-
 	// consumed one (e.g. two concurrent requests against the same resource whose responses
 	// completed out of dispatch order). This must not regress the tracked state.
-	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 90, Remaining: 4910, Reset: 1745121612})
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 90, Remaining: 4910, Reset: reset})
 
-	assert.Equal(t, &Rate{Limit: 5000, Used: 100, Remaining: 4900, Reset: 1745121612}, limits.Load(ResourceCore), "the fresher, more-consumed state must be kept")
+	assert.Equal(t, &Rate{Limit: 5000, Used: 100, Remaining: 4900, Reset: reset}, limits.Load(ResourceCore), "the fresher, more-consumed state must be kept")
 	assert.False(t, notified, "Notify must not fire for a dropped regression")
+}
+
+func TestLimits_Store_AcceptsCorrectionAfterExpiry(t *testing.T) {
+	// The existing state's window has already ended in wall-clock time (e.g. GitHub cleared its
+	// counter early - a "same window" correction whose response doesn't happen to carry an
+	// updated Reset). Once that's true, the update must be trusted even though it looks, on its
+	// face, like the exact same regression TestLimits_Store_DropsRegression rejects.
+	reset := uint64(time.Now().Add(-time.Hour).Unix())
+
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: reset})
+
+	var notified bool
+	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
+
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: reset})
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: reset}, limits.Load(ResourceCore), "a correction must be accepted once the existing window has expired")
+	assert.True(t, notified, "Notify must fire for an accepted update")
 }
 
 func TestLimits_Store_AcceptsNewerWindow(t *testing.T) {
@@ -184,20 +209,21 @@ func TestLimits_Store_Concurrent_OutOfOrder(t *testing.T) {
 	// of dispatch order: regardless of the order the writes actually land in, the tracked state
 	// must converge to the most-consumed (lowest Remaining) value observed, never a regression.
 	const n = 200
+	reset := uint64(time.Now().Add(time.Hour).Unix())
 	var limits Limits
-	limits.Store(nil, ResourceCore, &Rate{Limit: n, Used: 0, Remaining: n, Reset: 1745121612})
+	limits.Store(nil, ResourceCore, &Rate{Limit: n, Used: 0, Remaining: n, Reset: reset})
 
 	var wg sync.WaitGroup
 	for used := uint64(1); used <= n; used++ {
 		wg.Add(1)
 		go func(used uint64) {
 			defer wg.Done()
-			limits.Store(nil, ResourceCore, &Rate{Limit: n, Used: used, Remaining: n - used, Reset: 1745121612})
+			limits.Store(nil, ResourceCore, &Rate{Limit: n, Used: used, Remaining: n - used, Reset: reset})
 		}(used)
 	}
 	wg.Wait()
 
-	assert.Equal(t, &Rate{Limit: n, Used: n, Remaining: 0, Reset: 1745121612}, limits.Load(ResourceCore), "the most-consumed value observed must win regardless of write order")
+	assert.Equal(t, &Rate{Limit: n, Used: n, Remaining: 0, Reset: reset}, limits.Load(ResourceCore), "the most-consumed value observed must win regardless of write order")
 }
 
 func TestLimits_Reserve(t *testing.T) {
@@ -291,10 +317,14 @@ func TestLimits_Fetch_Success(t *testing.T) {
 }
 
 func TestLimits_Fetch_DropsStaleUpdate(t *testing.T) {
+	// The window must still be current (Reset in the future) for the anti-regression guard to
+	// apply at all; see TestLimits_Fetch_AcceptsCorrectionAfterExpiry for the opposite case.
+	reset := uint64(time.Now().Add(time.Hour).Unix())
+
 	// A real, concurrent request already observed the resource as fully
 	// exhausted within the current window.
 	var limits Limits
-	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612})
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: reset})
 
 	var notified bool
 	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
@@ -306,14 +336,41 @@ func TestLimits_Fetch_DropsStaleUpdate(t *testing.T) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{},
-			Body:       io.NopCloser(strings.NewReader(`{"resources":{"core":{"limit":5000,"used":743,"remaining":4257,"reset":1745121612}}}`)),
+			Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"resources":{"core":{"limit":5000,"used":743,"remaining":4257,"reset":%d}}}`, reset))),
 		}, nil
 	})
 	err := limits.Fetch(context.Background(), transport, nil)
 	assert.NoError(t, err, "(*Limits).Fetch failed")
 
-	assert.Equal(t, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612}, limits.Load(ResourceCore), "the fresher, more exhausted state must be kept")
+	assert.Equal(t, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: reset}, limits.Load(ResourceCore), "the fresher, more exhausted state must be kept")
 	assert.False(t, notified, "Notify must not fire for a dropped stale update")
+}
+
+func TestLimits_Fetch_AcceptsCorrectionAfterExpiry(t *testing.T) {
+	// The existing state's window has already ended in wall-clock time (e.g. GitHub cleared its
+	// counter early - a "same window" correction whose response doesn't happen to carry an
+	// updated Reset). Once that's true, Fetch's update must be trusted even though it looks, on
+	// its face, like the exact same regression TestLimits_Fetch_DropsStaleUpdate rejects.
+	reset := uint64(time.Now().Add(-time.Hour).Unix())
+
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: reset})
+
+	var notified bool
+	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
+
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"resources":{"core":{"limit":5000,"used":0,"remaining":5000,"reset":%d}}}`, reset))),
+		}, nil
+	})
+	err := limits.Fetch(context.Background(), transport, nil)
+	assert.NoError(t, err, "(*Limits).Fetch failed")
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: reset}, limits.Load(ResourceCore), "a correction must be accepted once the existing window has expired")
+	assert.True(t, notified, "Notify must fire for an accepted update")
 }
 
 func TestLimits_Fetch_AcceptsNewerWindow(t *testing.T) {

@@ -35,6 +35,11 @@ type Limits struct {
 // eventually consistent /rate_limit response, or from a concurrent request whose response simply
 // arrived after a fresher one) and is dropped. Notify is not invoked when the update is dropped,
 // since nothing changed.
+//
+// This guard only applies while the existing state's window is still current: once its Reset has
+// passed, the window has moved on in reality regardless of what Reset the new reading reports
+// (e.g. an out-of-band reset, such as GitHub clearing its counter early, whose response doesn't
+// happen to carry an updated Reset), so the new reading is trusted unconditionally instead.
 func (l *Limits) Store(resp *http.Response, resource Resource, rate *Rate) {
 	for {
 		existing := l.Load(resource)
@@ -44,7 +49,7 @@ func (l *Limits) Store(resp *http.Response, resource Resource, rate *Rate) {
 			}
 			continue
 		}
-		if rate.Reset <= existing.Reset && rate.Remaining > existing.Remaining {
+		if rate.Reset <= existing.Reset && rate.Remaining > existing.Remaining && !existing.expired() {
 			return
 		}
 		if l.m.CompareAndSwap(resource, existing, rate) {
