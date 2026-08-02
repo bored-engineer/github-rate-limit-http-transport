@@ -152,6 +152,54 @@ func TestLimits_Store_Notify(t *testing.T) {
 	assert.Same(t, rate, gotRate, "Notify should receive the *Rate passed to Store")
 }
 
+func TestLimits_Store_DropsRegression(t *testing.T) {
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 100, Remaining: 4900, Reset: 1745121612})
+
+	var notified bool
+	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
+
+	// A response reporting less consumption within the same window arrives after a fresher, more-
+	// consumed one (e.g. two concurrent requests against the same resource whose responses
+	// completed out of dispatch order). This must not regress the tracked state.
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 90, Remaining: 4910, Reset: 1745121612})
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 100, Remaining: 4900, Reset: 1745121612}, limits.Load(ResourceCore), "the fresher, more-consumed state must be kept")
+	assert.False(t, notified, "Notify must not fire for a dropped regression")
+}
+
+func TestLimits_Store_AcceptsNewerWindow(t *testing.T) {
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612})
+
+	// A later Reset (a new window) must be accepted even though Remaining is numerically greater
+	// than the prior window's exhausted state.
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745125212})
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745125212}, limits.Load(ResourceCore))
+}
+
+func TestLimits_Store_Concurrent_OutOfOrder(t *testing.T) {
+	// Simulates many concurrent requests against the same resource whose responses complete out
+	// of dispatch order: regardless of the order the writes actually land in, the tracked state
+	// must converge to the most-consumed (lowest Remaining) value observed, never a regression.
+	const n = 200
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: n, Used: 0, Remaining: n, Reset: 1745121612})
+
+	var wg sync.WaitGroup
+	for used := uint64(1); used <= n; used++ {
+		wg.Add(1)
+		go func(used uint64) {
+			defer wg.Done()
+			limits.Store(nil, ResourceCore, &Rate{Limit: n, Used: used, Remaining: n - used, Reset: 1745121612})
+		}(used)
+	}
+	wg.Wait()
+
+	assert.Equal(t, &Rate{Limit: n, Used: n, Remaining: 0, Reset: 1745121612}, limits.Load(ResourceCore), "the most-consumed value observed must win regardless of write order")
+}
+
 func TestLimits_Reserve(t *testing.T) {
 	var limits Limits
 	// No rate stored yet for the resource, should be a no-op.

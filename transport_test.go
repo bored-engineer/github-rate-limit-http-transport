@@ -342,9 +342,9 @@ func TestTransport_RoundTrip_DoesNotParseRateLimitEndpointResponse(t *testing.T)
 			assert.NoError(t, err, "(*Transport).RoundTrip failed")
 
 			// The /rate_limit response's own headers must not be parsed into Limits: that's
-			// (*Limits).Fetch's job (via its anti-regression-guarded storeFresh, using the full
-			// JSON body), not RoundTrip's. Parsing it here too would race Fetch's own write and
-			// fire a redundant Notify.
+			// (*Limits).Fetch's job (via Store, using the full JSON body), not RoundTrip's.
+			// Parsing it here too would redundantly re-store the same entry and fire a
+			// spurious extra Notify.
 			assert.Zero(t, notifyCalls.Load(), "RoundTrip must not Notify for a /rate_limit response")
 			assert.Equal(t, &Rate{Limit: 5000, Used: 1, Remaining: 4999, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
 		})
@@ -376,8 +376,8 @@ func TestTransport_Poll_DoesNotDoubleNotify(t *testing.T) {
 	defer cancel()
 	transport.Poll(ctx, time.Hour, nil)
 
-	// Exactly one Notify (from Fetch's storeFresh), not two (the second being the bug: RoundTrip
-	// separately parsing the same response's headers through the unguarded Store).
+	// Exactly one Notify (from Fetch's own Store call), not two (the second being the bug:
+	// RoundTrip separately re-parsing the same response's headers).
 	assert.Equal(t, int32(1), notifyCalls.Load())
 	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: 1745121612}, transport.Limits.Load(ResourceCore))
 }

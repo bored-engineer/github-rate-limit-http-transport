@@ -52,10 +52,9 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	}
 	// The /rate_limit endpoint's own response carries the same X-Ratelimit-* headers describing
 	// the core resource, but it must not be parsed here: (*Limits).Fetch already stores this
-	// response's full body (every resource, not just core) through the anti-regression-guarded
-	// storeFresh. Parsing it again here too would go through the unguarded Store instead, racing
-	// concurrent requests' fresher updates and silently re-introducing the regression storeFresh
-	// exists to prevent, plus firing a redundant Notify on every poll tick.
+	// response's full body (every resource, not just core, unlike these headers) via Store.
+	// Parsing it again here too would just redundantly re-store the same "core" entry a second
+	// time from the same response, firing a spurious extra Notify on every poll tick.
 	if resp != nil && !rateLimitEndpoint {
 		// Parse failures (e.g. malformed rate-limit headers) must not discard an otherwise
 		// valid response: doing so would drop resp.Body unclosed (leaking the connection) and
