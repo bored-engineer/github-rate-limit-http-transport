@@ -185,6 +185,17 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	}
 
 	for resource, rate := range limits.Resources {
+		// The /rate_limit endpoint's response can itself be stale (e.g. served from a cache or a
+		// lagging replica), reporting remaining == limit (used == 0) even though live traffic has
+		// already been consuming the resource. Trust that "full quota" reading only when there's no
+		// fresher evidence to the contrary: either nothing is stored yet, or the stored window has
+		// already expired. A reading that shows actual consumption (remaining < limit) proves it
+		// reflects real usage, so it's always safe to store regardless of what's already known.
+		if rate.Remaining >= rate.Limit {
+			if existing := l.Load(resource); existing != nil && !existing.expired() {
+				continue
+			}
+		}
 		l.Store(resp, resource, &rate)
 	}
 

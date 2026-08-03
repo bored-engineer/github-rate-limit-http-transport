@@ -432,6 +432,57 @@ func TestLimits_Fetch_AcceptsFurtherConsumption(t *testing.T) {
 	assert.Equal(t, &Rate{Limit: 5000, Used: 100, Remaining: 4900, Reset: 1745121612}, limits.Load(ResourceCore))
 }
 
+func TestLimits_Fetch_DropsStaleFullQuota(t *testing.T) {
+	// Live traffic (via X-Ratelimit headers) has already recorded real consumption within the
+	// current, still-active window.
+	reset := uint64(time.Now().Add(time.Hour).Unix())
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 100, Remaining: 4900, Reset: reset})
+
+	var notified bool
+	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
+
+	// A stale /rate_limit response reports remaining == limit (used == 0) for the same window -
+	// this must be dropped rather than regressing the known usage.
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"resources":{"core":{"limit":5000,"used":0,"remaining":5000,"reset":%d}}}`, reset))),
+		}, nil
+	})
+	err := limits.Fetch(context.Background(), transport, nil)
+	assert.NoError(t, err, "(*Limits).Fetch failed")
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 100, Remaining: 4900, Reset: reset}, limits.Load(ResourceCore), "a stale full-quota reading must not overwrite known usage")
+	assert.False(t, notified, "Notify must not fire for a dropped stale reading")
+}
+
+func TestLimits_Fetch_AcceptsFullQuotaWhenExistingExpired(t *testing.T) {
+	// The previously stored window has already expired (its Reset is in the past).
+	var limits Limits
+	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 5000, Remaining: 0, Reset: 1745121612})
+
+	var notified bool
+	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
+
+	// A /rate_limit response reporting remaining == limit for a new window must be accepted, since
+	// there's no fresher evidence to distrust it.
+	newReset := uint64(time.Now().Add(time.Hour).Unix())
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"resources":{"core":{"limit":5000,"used":0,"remaining":5000,"reset":%d}}}`, newReset))),
+		}, nil
+	})
+	err := limits.Fetch(context.Background(), transport, nil)
+	assert.NoError(t, err, "(*Limits).Fetch failed")
+
+	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: newReset}, limits.Load(ResourceCore))
+	assert.True(t, notified, "Notify must fire for an accepted update")
+}
+
 func TestLimits_Fetch_CustomURL(t *testing.T) {
 	custom := &url.URL{Scheme: "https", Host: "example.com", Path: "/custom/rate_limit"}
 
