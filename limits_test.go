@@ -158,8 +158,7 @@ func TestLimits_Store_AcceptsRegressionWithinSameWindow(t *testing.T) {
 	// Store intentionally does not guard against same-window staleness: a response reporting less
 	// consumption than one already seen (e.g. two concurrent requests whose responses completed
 	// out of dispatch order) is accepted like any other update, in exchange for not needing to
-	// compare Remaining at all. See TestLimits_Store_DropsOlderWindow for the one case it does
-	// still reject.
+	// compare Remaining at all.
 	reset := uint64(time.Now().Add(time.Hour).Unix())
 
 	var limits Limits
@@ -174,7 +173,11 @@ func TestLimits_Store_AcceptsRegressionWithinSameWindow(t *testing.T) {
 	assert.True(t, notified, "Notify must fire for an accepted update")
 }
 
-func TestLimits_Store_DropsOlderWindow(t *testing.T) {
+func TestLimits_Store_AcceptsOlderWindow(t *testing.T) {
+	// Store is unconditional: it doesn't compare Reset at all, so an update reporting an older
+	// window than what's already known still overwrites it. Callers that need to filter out a
+	// stale/out-of-order read (e.g. Fetch, for the /rate_limit endpoint) are responsible for doing
+	// so themselves before calling Store.
 	reset := uint64(time.Now().Add(time.Hour).Unix())
 
 	var limits Limits
@@ -183,19 +186,17 @@ func TestLimits_Store_DropsOlderWindow(t *testing.T) {
 	var notified bool
 	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
 
-	// An update reporting an older Reset than what's already known - e.g. a stale/out-of-order
-	// read - must still be dropped.
 	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 4000, Remaining: 1000, Reset: reset - 3600})
 
-	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: reset}, limits.Load(ResourceCore), "an older window must be kept out")
-	assert.False(t, notified, "Notify must not fire for a dropped update")
+	assert.Equal(t, &Rate{Limit: 5000, Used: 4000, Remaining: 1000, Reset: reset - 3600}, limits.Load(ResourceCore))
+	assert.True(t, notified, "Notify must fire for the accepted update")
 }
 
 func TestLimits_Store_NotBlockedByReserve(t *testing.T) {
 	// Simulates a burst of concurrent requests: Reserve optimistically pre-decrements for every
-	// one of them before any response comes back. Since Store's only guard is against an older
-	// Reset, Reserve's speculation (which never changes Reset) can never block a real response
-	// from taking effect, regardless of how far Reserve has run ahead of it.
+	// one of them before any response comes back. Since Store is unconditional, Reserve's
+	// speculation can never block a real response from taking effect, regardless of how far
+	// Reserve has run ahead of it.
 	reset := uint64(time.Now().Add(time.Hour).Unix())
 	var limits Limits
 	limits.Store(nil, ResourceCore, &Rate{Limit: 100, Used: 0, Remaining: 100, Reset: reset})
@@ -370,7 +371,10 @@ func TestLimits_Fetch_AcceptsSameWindowUpdate(t *testing.T) {
 	assert.True(t, notified, "Notify must fire for an accepted update")
 }
 
-func TestLimits_Fetch_DropsOlderWindow(t *testing.T) {
+func TestLimits_Fetch_AcceptsOlderWindowWithPartialUsage(t *testing.T) {
+	// Fetch's staleness filter only distrusts a full-quota (remaining == limit) reading; a reading
+	// that shows actual consumption is always passed through to Store, which is itself
+	// unconditional. So an older, stale Reset with partial usage still overwrites newer data.
 	reset := uint64(time.Now().Add(time.Hour).Unix())
 	var limits Limits
 	limits.Store(nil, ResourceCore, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: reset})
@@ -378,7 +382,6 @@ func TestLimits_Fetch_DropsOlderWindow(t *testing.T) {
 	var notified bool
 	limits.Notify = func(*http.Response, Resource, *Rate) { notified = true }
 
-	// Fetch reports an older Reset than what's already known - a stale read - and must be dropped.
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -389,8 +392,8 @@ func TestLimits_Fetch_DropsOlderWindow(t *testing.T) {
 	err := limits.Fetch(context.Background(), transport, nil)
 	assert.NoError(t, err, "(*Limits).Fetch failed")
 
-	assert.Equal(t, &Rate{Limit: 5000, Used: 0, Remaining: 5000, Reset: reset}, limits.Load(ResourceCore), "an older window must be kept out")
-	assert.False(t, notified, "Notify must not fire for a dropped update")
+	assert.Equal(t, &Rate{Limit: 5000, Used: 4000, Remaining: 1000, Reset: reset - 3600}, limits.Load(ResourceCore))
+	assert.True(t, notified, "Notify must fire for the accepted update")
 }
 
 func TestLimits_Fetch_AcceptsNewerWindow(t *testing.T) {
