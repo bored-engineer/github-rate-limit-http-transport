@@ -28,33 +28,11 @@ type Limits struct {
 	Notify func(*http.Response, Resource, *Rate)
 }
 
-// Store the rate limit for the given resource type, unless doing so would regress to an earlier
-// reset window: an update reporting an older Reset than what's already known is assumed to be a
-// stale or out-of-order read (e.g. from an eventually consistent /rate_limit response, or from a
-// concurrent request whose response simply arrived after a fresher one) and is dropped. Notify is
-// not invoked when the update is dropped, since nothing changed.
-//
-// Within the same (or a later) window, any update is accepted unconditionally - including one
-// reporting more Remaining than what's already known. This intentionally doesn't try to protect
-// against every kind of same-window staleness (Remaining can jitter non-monotonically as
-// concurrent responses complete out of order, and Reserve's own optimistic decrements are no
-// longer risk of being mistaken for one), in exchange for a much simpler implementation.
+// Store the rate limit for the given resource type unconditionally, overwriting any existing
+// value. Callers that need to filter out stale or out-of-order updates before they reach Store
+// are responsible for doing so themselves (see (*Limits).Fetch).
 func (l *Limits) Store(resp *http.Response, resource Resource, rate *Rate) {
-	for {
-		existing := l.Load(resource)
-		if existing == nil {
-			if _, loaded := l.m.LoadOrStore(resource, rate); !loaded {
-				break
-			}
-			continue
-		}
-		if rate.Reset < existing.Reset {
-			return
-		}
-		if l.m.CompareAndSwap(resource, existing, rate) {
-			break
-		}
-	}
+	l.m.Store(resource, rate)
 	if l.Notify != nil {
 		l.Notify(resp, resource, rate)
 	}
@@ -185,6 +163,17 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	}
 
 	for resource, rate := range limits.Resources {
+		// The /rate_limit endpoint's response can itself be stale (e.g. served from a cache or a
+		// lagging replica), reporting remaining == limit (used == 0) even though live traffic has
+		// already been consuming the resource. Trust that "full quota" reading only when there's no
+		// fresher evidence to the contrary: either nothing is stored yet, or the stored window has
+		// already expired. A reading that shows actual consumption (remaining < limit) proves it
+		// reflects real usage, so it's always safe to store regardless of what's already known.
+		if rate.Remaining >= rate.Limit {
+			if existing := l.Load(resource); existing != nil && !existing.expired() {
+				continue
+			}
+		}
 		l.Store(resp, resource, &rate)
 	}
 
